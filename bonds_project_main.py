@@ -1,9 +1,8 @@
 from tinkoff.invest import MarketDataRequest,AsyncClient, SubscriptionAction, LastPriceInstrument, SubscribeLastPriceRequest, Client, CandleInstrument, CandleInterval, SubscribeCandlesRequest, SubscriptionInterval
-from tokenAPI import token
+from tokenAPI import token, bottoken
 from datetime import date, datetime, timedelta
 import time
 import telebot
-from tokenAPI import bottoken
 import threading
 import requests
 from bs4 import BeautifulSoup as bs
