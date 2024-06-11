@@ -1,8 +1,9 @@
 from tinkoff.invest import MarketDataRequest,AsyncClient, SubscriptionAction, LastPriceInstrument, SubscribeLastPriceRequest, Client, CandleInstrument, CandleInterval, SubscribeCandlesRequest, SubscriptionInterval
-from tokenAPI import token, bottoken
+from tokenAPI import token
 from datetime import date, datetime, timedelta
 import time
 import telebot
+from tokenAPI import bottoken
 import threading
 import requests
 from bs4 import BeautifulSoup as bs
@@ -511,7 +512,7 @@ while True:
         break
     except Exception as e:
         print('Ошибка парсинга Smart-lab', e)
-
+print(len(uid_bonds))
 uid_for_bonds = []
 
 while True:
@@ -583,6 +584,7 @@ while True:
                 for candle in r.candles:
                     volume = candle.volume
                     volume_bonds[uid] = volume
+            time.sleep(0.05)
         break
     except Exception as e:
         print('Ошибка запроса исторических объёмов', e)
