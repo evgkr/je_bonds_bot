@@ -1,14 +1,19 @@
+import os
+from dotenv import load_dotenv
 from tinkoff.invest import MarketDataRequest,AsyncClient, SubscriptionAction, LastPriceInstrument, SubscribeLastPriceRequest, Client, CandleInstrument, CandleInterval, SubscribeCandlesRequest, SubscriptionInterval
-from tokenAPI import token
 from datetime import date, datetime, timedelta
 import time
 import telebot
-from tokenAPI import bottoken
 import threading
 import requests
 from bs4 import BeautifulSoup as bs
 import asyncio
 from tqdm import tqdm
+
+load_dotenv()
+
+token = os.getenv("TOKEN")
+bottoken = os.getenv("BOT_TOKEN")
 
 bot = telebot.TeleBot(bottoken)
 
