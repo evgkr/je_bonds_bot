@@ -2753,7 +2753,7 @@ def _awz_kb_group_rating(uid: int) -> InlineKeyboardMarkup:
 
 def _awz_kb_step2(uid: Optional[int] = None) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    kb.button(text="➡️ Сontinue", callback_data="alerts:w:step3")
+    kb.button(text="➡️ Continue", callback_data="alerts:w:step3")
 
     kb.button(text="Issue size", callback_data="alerts:w:fr:issue")
     kb.button(text="Sectors ▸", callback_data="alerts:w:fcat:sectors")
@@ -3721,7 +3721,7 @@ def _alerts_digest_nav_kb(page_idx: int, total: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
 
     if total <= 1:
-        kb.row(InlineKeyboardButton(text="❌ Close", callback_data="adg:close"))
+        kb.row(InlineKeyboardButton(text="✖️ Close", callback_data="adg:close"))
         return kb.as_markup()
 
     kb.row(
@@ -3731,7 +3731,7 @@ def _alerts_digest_nav_kb(page_idx: int, total: int) -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="▶️", callback_data="adg:next"),
         InlineKeyboardButton(text="⏭", callback_data="adg:last"),
     )
-    kb.row(InlineKeyboardButton(text="❌ Close", callback_data="adg:close"))
+    kb.row(InlineKeyboardButton(text="✖️ Close", callback_data="adg:close"))
     return kb.as_markup()
 
 
@@ -4562,10 +4562,9 @@ async def _alerts_process_bucket(now_msk: datetime, force: bool = False):
                     msg_lines = []
                     msg_lines.append(f"🔔 <b>Alert: {label}</b>")
                     msg_lines.append("")
-                    msg_lines.append(f"Bond: {_alerts_tinkoff_link(r)}")
+                    msg_lines.append(f"<b>Bond:</b> {_alerts_tinkoff_link(r)}")
                     msg_lines.append("")
                     if checks:
-                        msg_lines.append("")
                         msg_lines.append("<b>Matched:</b>")
                         for label in checks:
                             msg_lines.append(f"🔹 {html.escape(label, quote=False)}")
