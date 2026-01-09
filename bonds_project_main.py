@@ -5925,6 +5925,11 @@ async def cb_alerts(q: CallbackQuery):
                 ui.screen = "aw_time_pick"
                 ui.awaiting = None
 
+            elif cmd == "time_pick":
+                # back from manual time input -> presets menu
+                ui.screen = "aw_time_pick"
+                ui.awaiting = None
+
             elif cmd == "time":
                 if arg == "other":
                     ui.screen = "aw_time_input"
