@@ -1466,8 +1466,11 @@ def presets_keyboard(state: ScreenerState) -> InlineKeyboardMarkup:
         kb.button(text=text, callback_data=f"preset:apply:{key}")
     # user
     if state.presets:
-        for name in sorted(state.presets.keys()):
-            kb.button(text=name, callback_data=f"preset:apply:user:{quote(name)}")
+        # фиксируем порядок, чтобы индекс был стабильным
+        names = sorted(state.presets.keys())
+        for i, name in enumerate(names):
+            kb.button(text=name, callback_data=f"preset:apply:user:{i}")
+
     kb.button(text="💾 Save current", callback_data="preset:save")
     kb.button(text="← Back", callback_data="menu:main")
     kb.adjust(1)
