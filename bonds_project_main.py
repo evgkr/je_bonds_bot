@@ -6,7 +6,7 @@ from tokenAPI import bottoken
 from tqdm import tqdm
 import requests
 import math
-import pyxirr as px
+import pyxirr as pxa
 import asyncio
 import time
 from collections import defaultdict
@@ -216,6 +216,12 @@ class ScreenerState:
     message_id: Optional[int] = None
     last_render_hash: Optional[int] = None
     last_edit_ts: float = 0.0
+    # --- debounce/throttle для редактирования главного сообщения скринера ---
+    pending_text: Optional[str] = None
+    pending_markup: Optional[InlineKeyboardMarkup] = None
+    pending_due_ts: float = 0.0
+    pending_task: Optional[asyncio.Task] = field(default=None, repr=False, compare=False)
+    render_seq: int = 0
     awaiting_input: Optional[str] = None
     prompt_msg_id: Optional[int] = None
     list_view_msg_id: Optional[int] = None
@@ -1754,78 +1760,195 @@ bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 dp.callback_query.middleware(IdleTouchMiddleware(bot))
 
-async def _schedule_edit(st: ScreenerState, text: str, delay: float):
-    await asyncio.sleep(max(0.0, delay))
+def _screener_kb_sig(markup: Optional[InlineKeyboardMarkup]) -> Any:
+    if not markup:
+        return ()
     try:
-        await bot.edit_message_text(
-            chat_id=st.chat_id,
-            message_id=st.message_id,
-            text=text,
-            reply_markup=current_markup(st),
-            link_preview_options=LP_DISABLED
-        )
-        st.last_render_hash = hash(f"{st.page_idx}|{st.ui_mode}|{text}")
-        st.last_edit_ts = time.time()
-    except TelegramBadRequest as e:
-        if "message is not modified" in str(e).lower():
-            st.last_render_hash = hash(f"{st.page_idx}|{st.ui_mode}|{text}")
-            st.last_edit_ts = time.time()
+        rows = []
+        for row in (markup.inline_keyboard or []):
+            rows.append(tuple(
+                (b.text, getattr(b, "callback_data", None), getattr(b, "url", None))
+                for b in row
+            ))
+        return tuple(rows)
     except Exception:
-        pass
+        return str(markup)
 
-async def safe_edit(st: ScreenerState, text: str):
-    def _calc_hash(s: str) -> int:
-        return hash(f"{st.page_idx}|{st.ui_mode}|{s}")
 
-    new_hash = _calc_hash(text)
-    now = time.time()
+def _screener_render_hash(st: ScreenerState, text: str, markup: Optional[InlineKeyboardMarkup]) -> int:
+    # Включаем page/ui_mode + “сигнатуру” клавиатуры, чтобы хэш отражал реальный вид сообщения
+    return hash((st.page_idx, st.ui_mode, text, _screener_kb_sig(markup)))
 
-    if st.last_render_hash is not None and new_hash == st.last_render_hash:
-        return
 
-    delta = now - st.last_edit_ts
-    if delta <= EDIT_THROTTLE_SECONDS:
-        delay = (EDIT_THROTTLE_SECONDS - delta) + 0.05
-        asyncio.create_task(_schedule_edit(st, text, delay))
-        return
+def _screener_extract_retry_after(e: Exception) -> Optional[int]:
+    # TelegramRetryAfter имеет retry_after
+    ra = getattr(e, "retry_after", None)
+    if isinstance(ra, (int, float)) and ra > 0:
+        return int(ra)
 
+    # Иногда Telegram пишет "retry after N" в тексте ошибки
+    s = str(e).lower()
+    m = re.search(r"retry after (\d+)", s)
+    if m:
+        try:
+            return int(m.group(1))
+        except Exception:
+            return None
+    return None
+
+
+async def _screener_edit_with_shrink(
+    st: ScreenerState,
+    text: str,
+    markup: Optional[InlineKeyboardMarkup],
+    preset_hash: Optional[int] = None,
+):
     attempts = 0
+
     while True:
+        if not st.chat_id or not st.message_id:
+            return
+
+        h = preset_hash if preset_hash is not None else _screener_render_hash(st, text, markup)
+
         try:
             await bot.edit_message_text(
                 chat_id=st.chat_id,
                 message_id=st.message_id,
                 text=text,
-                reply_markup=current_markup(st),
-                link_preview_options=LP_DISABLED
+                reply_markup=markup,
+                link_preview_options=LP_DISABLED,
             )
-            st.last_render_hash = hash(f"{st.page_idx}|{st.ui_mode}|{text}")
+            st.last_render_hash = h
             st.last_edit_ts = time.time()
             return
+
         except TelegramBadRequest as e:
             emsg = str(e).lower()
+
             if "message is not modified" in emsg:
-                st.last_render_hash = hash(f"{st.page_idx}|{st.ui_mode}|{text}")
+                st.last_render_hash = h
                 st.last_edit_ts = time.time()
                 return
 
+            if "message to edit not found" in emsg:
+                st.message_id = None
+                return
+
             too_long = (
-                    "text is too long" in emsg
-                    or "message is too long" in emsg
-                    or "entities" in emsg
-                    or "entity" in emsg
+                "text is too long" in emsg
+                or "message is too long" in emsg
+                or "entities" in emsg
+                or "entity" in emsg
             )
             if not too_long:
-                # чужая ошибка — выходим
                 return
 
             # уменьшаем cap на 1, перерендериваем и повторяем
             cur = int(st.tx_rows_cap or MAX_LINES_PER_PAGE)
             st.tx_rows_cap = max(1, cur - 1)
             text, _ = render_page(st, snapshot_data())
+            markup = current_markup(st)
+            preset_hash = None  # пересчитать хэш под новый текст/markup
+
             attempts += 1
-            if attempts > (MAX_LINES_PER_PAGE + 5):  # предохранитель
+            if attempts > (MAX_LINES_PER_PAGE + 5):
                 return
+
+        except TelegramRetryAfter as e:
+            ra = int(getattr(e, "retry_after", 0) or 0)
+            # Не блокируем хендлер — переводим в pending flush
+            st.pending_text = text
+            st.pending_markup = markup
+            st.pending_due_ts = time.time() + ra + 0.25
+
+            if st.pending_task and not st.pending_task.done():
+                st.pending_task.cancel()
+            st.pending_task = asyncio.create_task(_screener_flush_pending(st, st.render_seq))
+            return
+
+        except Exception:
+            ra = _screener_extract_retry_after(Exception())
+            if ra:
+                st.pending_text = text
+                st.pending_markup = markup
+                st.pending_due_ts = time.time() + ra + 0.25
+                if st.pending_task and not st.pending_task.done():
+                    st.pending_task.cancel()
+                st.pending_task = asyncio.create_task(_screener_flush_pending(st, st.render_seq))
+            return
+
+
+async def _screener_flush_pending(st: ScreenerState, seq: int):
+    task = asyncio.current_task()
+    try:
+        delay = max(0.0, st.pending_due_ts - time.time())
+        if delay > 0:
+            await asyncio.sleep(delay)
+
+        # если уже был новый рендер-запрос — этот flush устарел
+        if seq != st.render_seq:
+            return
+
+        if not st.chat_id or not st.message_id:
+            return
+
+        text = st.pending_text
+        markup = st.pending_markup
+        if text is None:
+            return
+
+        h = _screener_render_hash(st, text, markup)
+        if st.last_render_hash is not None and h == st.last_render_hash:
+            return
+
+        await _screener_edit_with_shrink(st, text, markup, h)
+
+    except asyncio.CancelledError:
+        return
+
+    finally:
+        # ВАЖНО: не затираем ссылку на более новую pending_task
+        if st.pending_task is task:
+            st.pending_task = None
+
+
+async def safe_edit(st: ScreenerState, text: str):
+    if not st.chat_id or not st.message_id:
+        return
+
+    # Каждое новое желание “показать UI” увеличивает seq.
+    # Это позволяет игнорировать устаревшие flush-задачи.
+    st.render_seq += 1
+    seq = st.render_seq
+
+    markup = current_markup(st)
+
+    # Запоминаем “последнее желаемое состояние”
+    st.pending_text = text
+    st.pending_markup = markup
+
+    new_hash = _screener_render_hash(st, text, markup)
+    if st.last_render_hash is not None and new_hash == st.last_render_hash:
+        return
+
+    now = time.time()
+    delta = now - (st.last_edit_ts or 0.0)
+
+    # throttling — схлопываем частые апдейты в один финальный flush
+    if delta <= EDIT_THROTTLE_SECONDS:
+        st.pending_due_ts = now + (EDIT_THROTTLE_SECONDS - delta) + 0.05
+        if st.pending_task and not st.pending_task.done():
+            st.pending_task.cancel()
+        st.pending_task = asyncio.create_task(_screener_flush_pending(st, seq))
+        return
+
+    # Можно редактировать сразу — отменяем старый pending, чтобы не было “откатов”
+    if st.pending_task and not st.pending_task.done():
+        st.pending_task.cancel()
+    st.pending_task = None
+
+    await _screener_edit_with_shrink(st, text, markup, new_hash)
 
 async def safe_send_initial(m: Message, st: ScreenerState):
     # стартуем с потолка
@@ -1834,11 +1957,21 @@ async def safe_send_initial(m: Message, st: ScreenerState):
     while True:
         text, _ = render_page(st, snapshot_data())
         try:
-            msg = await m.answer(text, reply_markup=current_markup(st), link_preview_options=LP_DISABLED)
+            markup = current_markup(st)
+            msg = await m.answer(text, reply_markup=markup, link_preview_options=LP_DISABLED)
             st.message_id = msg.message_id
-            st.last_render_hash = hash(f"{st.page_idx}|{st.ui_mode}|{text}")
+            st.last_render_hash = _screener_render_hash(st, text, markup)
             st.last_edit_ts = time.time()
+
+            # сброс pending (на всякий)
+            st.pending_text = None
+            st.pending_markup = None
+            st.pending_due_ts = 0.0
+            if st.pending_task and not st.pending_task.done():
+                st.pending_task.cancel()
+            st.pending_task = None
             return
+
         except TelegramBadRequest as e:
             emsg = str(e).lower()
             too_long = (
@@ -1859,10 +1992,18 @@ async def safe_send_initial(m: Message, st: ScreenerState):
                 # предохранитель на случай «не влезает даже 1»
                 head = "\n".join(header_lines(st))
                 fallback = head + "\n\n⚠️ Page is too dense for Telegram. Narrow filters or reduce fields."
-                msg = await m.answer(fallback, reply_markup=current_markup(st), link_preview_options=LP_DISABLED)
+                markup = current_markup(st)
+                msg = await m.answer(fallback, reply_markup=markup, link_preview_options=LP_DISABLED)
                 st.message_id = msg.message_id
-                st.last_render_hash = hash(f"{st.page_idx}|{st.ui_mode}|{fallback}")
+                st.last_render_hash = _screener_render_hash(st, fallback, markup)
                 st.last_edit_ts = time.time()
+
+                st.pending_text = None
+                st.pending_markup = None
+                st.pending_due_ts = 0.0
+                if st.pending_task and not st.pending_task.done():
+                    st.pending_task.cancel()
+                st.pending_task = None
                 return
 
 async def rerender_one(user_id: int):
@@ -7494,6 +7635,11 @@ def historic_prices_request():
             count += 1
             if instrument_id in uid_bonds:
                 uid_bonds.remove(instrument_id)
+
+    # гарантируем ключи для всех оставшихся uid, чтобы стрим не падал с KeyError
+    for uid in uid_bonds:
+        last_price_bonds.setdefault(uid, None)
+
     confirming_list_for_analysis()
     print('Из-за отсутсвия информации по последним ценам, было удалено', count, 'облигаций(и, я).')
     return last_price_bonds
@@ -7575,10 +7721,23 @@ async def volumes_and_last_prices_stream(uids_chunk: list[str], q: asyncio.Queue
                     if getattr(r, "candle", None):
                         last_seen = time.monotonic()
                         instrument_id = r.candle.instrument_uid
-                        volume_bonds[instrument_id] = r.candle.volume
-                        if r.candle.close is not None and r.candle.close != 0:
-                            price = (r.candle.close.units + (r.candle.close.nano * 1e-9)) / 100 * nominal_bonds.get(instrument_id, 0)
-                            if price != last_price_bonds[instrument_id]:
+
+                        # объём
+                        if getattr(r.candle, "volume", None) is not None:
+                            volume_bonds[instrument_id] = r.candle.volume
+
+                        close = r.candle.close
+                        if close is not None and (close.units != 0 or close.nano != 0):
+                            nominal = nominal_bonds.get(instrument_id)
+                            if not nominal:
+                                # не должно происходить, но не роняем стрим
+                                print(f"[{_ts()}] ⚠️ {name}: nominal missing for {instrument_id}, skip candle")
+                                continue
+
+                            price = (close.units + (close.nano * 1e-9)) / 100.0 * nominal
+
+                            prev = last_price_bonds.get(instrument_id)  # <- безопасно
+                            if prev is None or price != prev:
                                 last_price_bonds[instrument_id] = price
                                 asyncio.create_task(asyncio.to_thread(
                                     profitability_and_duration_calculation, price, instrument_id
@@ -7644,6 +7803,85 @@ def profitability_and_duration_calculation(price, instrument_id):
 
     settlement_date = get_settlement_day().date()
 
+    # --- helpers: безопасный XIRR и безопасные duration/convexity ---
+    def _safe_xirr(dates, cfs):
+        # если есть None/NaN в CF — xirr не считаем
+        try:
+            for x in cfs:
+                if x is None:
+                    return None
+                xf = float(x)
+                if not math.isfinite(xf):
+                    return None
+        except Exception:
+            return None
+
+        # xirr имеет смысл только если есть смена знака
+        try:
+            has_pos = any(float(x) > 0 for x in cfs)
+            has_neg = any(float(x) < 0 for x in cfs)
+            if not (has_pos and has_neg):
+                return None
+        except Exception:
+            return None
+
+        try:
+            y = px.xirr(dates, cfs)
+        except Exception:
+            return None
+
+        if y is None:
+            return None
+
+        try:
+            y = float(y)
+        except Exception:
+            return None
+
+        if not math.isfinite(y):
+            return None
+
+        return y
+
+    def mac_dur_conv(dates, cfs, y, pv_):
+        # КРИТИЧНО: если y не посчитался — не падаем
+        if y is None:
+            return None, None, None
+        try:
+            y = float(y)
+        except Exception:
+            return None, None, None
+        if not math.isfinite(y):
+            return None, None, None
+        if y <= -0.999999:  # 1+y <= 0
+            return None, None, None
+        if pv_ is None or pv_ == 0:
+            return None, None, None
+
+        iy = 1.0 + y
+        s_mac = 0.0
+        s_conv = 0.0
+        for d, cf in zip(dates, cfs):
+            if d is None or cf is None:
+                return None, None, None
+            t = (d - today_).days / 365.0
+            try:
+                s_mac += t * cf * (iy ** (-t))
+                s_conv += t * (t + 1.0) * cf * (iy ** (-t - 2.0))
+            except Exception:
+                return None, None, None
+        d_mac = s_mac / pv_
+        d_mod = d_mac / iy
+        c_mod = s_conv / pv_
+        return d_mac, d_mod, c_mod
+
+    def _dpp(dmod, cmod):
+        if dmod is None or cmod is None:
+            return None, None
+        return (-dmod * dy1 + 0.5 * cmod * dy1 * dy1,
+                dmod * dy1 + 0.5 * cmod * dy1 * dy1)
+
+    # --- CF до погашения ---
     cm_dates = sorted(coupons_to_maturity_bonds[instrument_id].keys())
     cm_cfs = [coupons_to_maturity_bonds[instrument_id][d] for d in cm_dates]
 
@@ -7660,39 +7898,36 @@ def profitability_and_duration_calculation(price, instrument_id):
             w_cm_dates = w_cm_dates[1:]
             w_cm_cfs = w_cm_cfs[1:]
 
-    def mac_dur_conv(dates, cfs, y, pv_):
-        iy = 1.0 + y
-        s_mac = 0.0
-        s_conv = 0.0
-        for d, cf in zip(dates, cfs):
-            t = (d - today_).days / 365.0
-            s_mac += t * cf * (iy ** (-t))
-            s_conv += t * (t + 1.0) * cf * (iy ** (-t - 2.0))
-        d_mac = s_mac / pv_
-        d_mod = d_mac / iy
-        c_mod = s_conv / pv_
-        return d_mac, d_mod, c_mod
-
-    YTM_xirr = px.xirr(
+    # --- YTM (обычный) ---
+    YTM_xirr = _safe_xirr(
         [today_, *cm_dates, maturity_date_bonds[instrument_id]],
         [-pv, *cm_cfs, nominal_bonds[instrument_id]]
     )
 
-    weighted_YTM_xirr = px.xirr(
+    # --- YTM (weighted, как у тебя) ---
+    surv_m = survival_on_date(
+        credit_rating_bonds[instrument_id],
+        maturity_date_bonds[instrument_id],
+        lambdas_by_rating
+    )
+    w_red_m = nominal_bonds[instrument_id] * surv_m if surv_m is not None else None
+
+    weighted_YTM_xirr = _safe_xirr(
         [today_, *w_cm_dates, maturity_date_bonds[instrument_id]],
-        [-pv, *w_cm_cfs,
-         nominal_bonds[instrument_id] * survival_on_date(credit_rating_bonds[instrument_id],
-                                                         maturity_date_bonds[instrument_id], lambdas_by_rating)]
+        [-pv, *w_cm_cfs, w_red_m]
     )
 
+    # --- durations/convexity ---
     dates_m = [*cm_dates, maturity_date_bonds[instrument_id]]
     cfs_m = [*cm_cfs, nominal_bonds[instrument_id]]
     mac_ytm, dmod_ytm, cmod_ytm = mac_dur_conv(dates_m, cfs_m, YTM_xirr, pv)
 
+    # ВАЖНО: сохраняем твою логику — weighted CF, но yield ОДИНАКОВЫЙ (обычный YTM_xirr)
     w_dates_m = [*w_cm_dates, maturity_date_bonds[instrument_id]]
-    w_cfs_m = [*w_cm_cfs, nominal_bonds[instrument_id] * survival_on_date(credit_rating_bonds[instrument_id], maturity_date_bonds[instrument_id], lambdas_by_rating)]
+    w_cfs_m = [*w_cm_cfs, w_red_m]
     w_mac_ytm, w_dmod_ytm, w_cmod_ytm = mac_dur_conv(w_dates_m, w_cfs_m, YTM_xirr, pv)
 
+    # --- YTC ---
     if instrument_id in offer_or_call_option_date_bonds.keys():
 
         co_dates = sorted(coupons_to_offer_bonds[instrument_id].keys())
@@ -7710,54 +7945,106 @@ def profitability_and_duration_calculation(price, instrument_id):
                 w_co_dates = w_co_dates[1:]
                 w_co_cfs = w_co_cfs[1:]
 
-        YTC_xirr = px.xirr(
-            [today_, *co_dates,
-             offer_or_call_option_date_bonds[instrument_id]],
-            [-pv, *co_cfs,
-             nominal_bonds[instrument_id]]
+        YTC_xirr = _safe_xirr(
+            [today_, *co_dates, offer_or_call_option_date_bonds[instrument_id]],
+            [-pv, *co_cfs, nominal_bonds[instrument_id]]
         )
 
-        weighted_YTC_xirr = px.xirr(
-            [today_, *w_co_dates,
-             offer_or_call_option_date_bonds[instrument_id]],
-            [-pv, *w_co_cfs,
-             nominal_bonds[instrument_id] * survival_on_date(credit_rating_bonds[instrument_id],
-                                                             offer_or_call_option_date_bonds[instrument_id],
-                                                             lambdas_by_rating)]
+        surv_c = survival_on_date(
+            credit_rating_bonds[instrument_id],
+            offer_or_call_option_date_bonds[instrument_id],
+            lambdas_by_rating
+        )
+        w_red_c = nominal_bonds[instrument_id] * surv_c if surv_c is not None else None
+
+        weighted_YTC_xirr = _safe_xirr(
+            [today_, *w_co_dates, offer_or_call_option_date_bonds[instrument_id]],
+            [-pv, *w_co_cfs, w_red_c]
         )
 
+        # оставляю как у тебя (keys/values) — логика не тронута
         dates_c = [*coupons_to_offer_bonds[instrument_id].keys(), offer_or_call_option_date_bonds[instrument_id]]
         cfs_c = [*coupons_to_offer_bonds[instrument_id].values(), nominal_bonds[instrument_id]]
 
         w_dates_c = [*weighted_coupons_to_offer_bonds[instrument_id].keys(), offer_or_call_option_date_bonds[instrument_id]]
-        w_cfs_c = [*weighted_coupons_to_offer_bonds[instrument_id].values(), nominal_bonds[instrument_id] * survival_on_date(credit_rating_bonds[instrument_id], offer_or_call_option_date_bonds[instrument_id], lambdas_by_rating)]
+        w_cfs_c = [*weighted_coupons_to_offer_bonds[instrument_id].values(), w_red_c]
     else:
         YTC_xirr = YTM_xirr
         weighted_YTC_xirr = weighted_YTM_xirr
         dates_c, cfs_c, w_dates_c, w_cfs_c = dates_m, cfs_m, w_dates_m, w_cfs_m
 
     mac_ytc, dmod_ytc, cmod_ytc = mac_dur_conv(dates_c, cfs_c, YTC_xirr, pv)
+
+    # ВАЖНО: сохраняем твою логику — weighted CF, но yield ОДИНАКОВЫЙ (обычный YTC_xirr)
     w_mac_ytc, w_dmod_ytc, w_cmod_ytc = mac_dur_conv(w_dates_c, w_cfs_c, YTC_xirr, pv)
 
-    if YTC_xirr < YTM_xirr:
-        YTW_xirr = YTC_xirr
-        days_YTW = (offer_or_call_option_date_bonds[instrument_id] - today_).days
-        mac_ytw, dmod_ytw, cmod_ytw = mac_ytc, dmod_ytc, cmod_ytc
-    else:
+    # --- YTW (обычный) — безопасное сравнение при None ---
+    offer_date = offer_or_call_option_date_bonds.get(instrument_id)
+
+    if offer_date is None:
         YTW_xirr = YTM_xirr
         days_YTW = (maturity_date_bonds[instrument_id] - today_).days
         mac_ytw, dmod_ytw, cmod_ytw = mac_ytm, dmod_ytm, cmod_ytm
-
-    if weighted_YTC_xirr < weighted_YTM_xirr:
-        weighted_YTW_xirr = weighted_YTC_xirr
-        days_weighted_YTW = (offer_or_call_option_date_bonds[instrument_id] - today_).days
-        w_mac_ytw, w_dmod_ytw, w_cmod_ytw = w_mac_ytc, w_dmod_ytc, w_cmod_ytc
     else:
+        if YTC_xirr is None and YTM_xirr is None:
+            YTW_xirr = None
+            days_YTW = None
+            mac_ytw, dmod_ytw, cmod_ytw = None, None, None
+        elif YTM_xirr is None:
+            YTW_xirr = YTC_xirr
+            days_YTW = (offer_date - today_).days
+            mac_ytw, dmod_ytw, cmod_ytw = mac_ytc, dmod_ytc, cmod_ytc
+        elif YTC_xirr is None:
+            YTW_xirr = YTM_xirr
+            days_YTW = (maturity_date_bonds[instrument_id] - today_).days
+            mac_ytw, dmod_ytw, cmod_ytw = mac_ytm, dmod_ytm, cmod_ytm
+        else:
+            if YTC_xirr < YTM_xirr:
+                YTW_xirr = YTC_xirr
+                days_YTW = (offer_date - today_).days
+                mac_ytw, dmod_ytw, cmod_ytw = mac_ytc, dmod_ytc, cmod_ytc
+            else:
+                YTW_xirr = YTM_xirr
+                days_YTW = (maturity_date_bonds[instrument_id] - today_).days
+                mac_ytw, dmod_ytw, cmod_ytw = mac_ytm, dmod_ytm, cmod_ytm
+
+    # --- YTW (weighted yields) — безопасное сравнение при None ---
+    if offer_date is None:
         weighted_YTW_xirr = weighted_YTM_xirr
         days_weighted_YTW = (maturity_date_bonds[instrument_id] - today_).days
         w_mac_ytw, w_dmod_ytw, w_cmod_ytw = w_mac_ytm, w_dmod_ytm, w_cmod_ytm
+    else:
+        if weighted_YTC_xirr is None and weighted_YTM_xirr is None:
+            weighted_YTW_xirr = None
+            days_weighted_YTW = None
+            w_mac_ytw, w_dmod_ytw, w_cmod_ytw = None, None, None
+        elif weighted_YTM_xirr is None:
+            weighted_YTW_xirr = weighted_YTC_xirr
+            days_weighted_YTW = (offer_date - today_).days
+            w_mac_ytw, w_dmod_ytw, w_cmod_ytw = w_mac_ytc, w_dmod_ytc, w_cmod_ytc
+        elif weighted_YTC_xirr is None:
+            weighted_YTW_xirr = weighted_YTM_xirr
+            days_weighted_YTW = (maturity_date_bonds[instrument_id] - today_).days
+            w_mac_ytw, w_dmod_ytw, w_cmod_ytw = w_mac_ytm, w_dmod_ytm, w_cmod_ytm
+        else:
+            if weighted_YTC_xirr < weighted_YTM_xirr:
+                weighted_YTW_xirr = weighted_YTC_xirr
+                days_weighted_YTW = (offer_date - today_).days
+                w_mac_ytw, w_dmod_ytw, w_cmod_ytw = w_mac_ytc, w_dmod_ytc, w_cmod_ytc
+            else:
+                weighted_YTW_xirr = weighted_YTM_xirr
+                days_weighted_YTW = (maturity_date_bonds[instrument_id] - today_).days
+                w_mac_ytw, w_dmod_ytw, w_cmod_ytw = w_mac_ytm, w_dmod_ytm, w_cmod_ytm
 
-    YTM_xirr_bonds[instrument_id], weighted_YTM_xirr_bonds[instrument_id], YTC_xirr_bonds[instrument_id], weighted_YTC_xirr_bonds[instrument_id], YTW_xirr_bonds[instrument_id], weighted_YTW_xirr_bonds[instrument_id], days_YTW_bonds[instrument_id], days_weighted_YTW_bonds[instrument_id] = YTM_xirr, weighted_YTM_xirr, YTC_xirr, weighted_YTC_xirr, YTW_xirr, weighted_YTW_xirr, days_YTW, days_weighted_YTW
+    # --- сохраняем метрики ---
+    YTM_xirr_bonds[instrument_id] = YTM_xirr
+    weighted_YTM_xirr_bonds[instrument_id] = weighted_YTM_xirr
+    YTC_xirr_bonds[instrument_id] = YTC_xirr
+    weighted_YTC_xirr_bonds[instrument_id] = weighted_YTC_xirr
+    YTW_xirr_bonds[instrument_id] = YTW_xirr
+    weighted_YTW_xirr_bonds[instrument_id] = weighted_YTW_xirr
+    days_YTW_bonds[instrument_id] = days_YTW
+    days_weighted_YTW_bonds[instrument_id] = days_weighted_YTW
 
     macaulay_YTM_bonds[instrument_id] = mac_ytm
     modified_YTM_bonds[instrument_id] = dmod_ytm
@@ -7769,12 +8056,9 @@ def profitability_and_duration_calculation(price, instrument_id):
     modified_YTW_bonds[instrument_id] = dmod_ytw
     convexity_YTW_bonds[instrument_id] = cmod_ytw
 
-    dpp_1pct_up_YTM_bonds[instrument_id] = -dmod_ytm * dy1 + 0.5 * cmod_ytm * dy1 * dy1
-    dpp_1pct_down_YTM_bonds[instrument_id] = dmod_ytm * dy1 + 0.5 * cmod_ytm * dy1 * dy1
-    dpp_1pct_up_YTC_bonds[instrument_id] = -dmod_ytc * dy1 + 0.5 * cmod_ytc * dy1 * dy1
-    dpp_1pct_down_YTC_bonds[instrument_id] = dmod_ytc * dy1 + 0.5 * cmod_ytc * dy1 * dy1
-    dpp_1pct_up_YTW_bonds[instrument_id] = -dmod_ytw * dy1 + 0.5 * cmod_ytw * dy1 * dy1
-    dpp_1pct_down_YTW_bonds[instrument_id] = dmod_ytw * dy1 + 0.5 * cmod_ytw * dy1 * dy1
+    dpp_1pct_up_YTM_bonds[instrument_id], dpp_1pct_down_YTM_bonds[instrument_id] = _dpp(dmod_ytm, cmod_ytm)
+    dpp_1pct_up_YTC_bonds[instrument_id], dpp_1pct_down_YTC_bonds[instrument_id] = _dpp(dmod_ytc, cmod_ytc)
+    dpp_1pct_up_YTW_bonds[instrument_id], dpp_1pct_down_YTW_bonds[instrument_id] = _dpp(dmod_ytw, cmod_ytw)
 
     weighted_macaulay_YTM_bonds[instrument_id] = w_mac_ytm
     weighted_modified_YTM_bonds[instrument_id] = w_dmod_ytm
@@ -7786,12 +8070,9 @@ def profitability_and_duration_calculation(price, instrument_id):
     weighted_modified_YTW_bonds[instrument_id] = w_dmod_ytw
     weighted_convexity_YTW_bonds[instrument_id] = w_cmod_ytw
 
-    weighted_dpp_1pct_up_YTM_bonds[instrument_id] = -w_dmod_ytm * dy1 + 0.5 * w_cmod_ytm * dy1 * dy1
-    weighted_dpp_1pct_down_YTM_bonds[instrument_id] = w_dmod_ytm * dy1 + 0.5 * w_cmod_ytm * dy1 * dy1
-    weighted_dpp_1pct_up_YTC_bonds[instrument_id] = -w_dmod_ytc * dy1 + 0.5 * w_cmod_ytc * dy1 * dy1
-    weighted_dpp_1pct_down_YTC_bonds[instrument_id] = w_dmod_ytc * dy1 + 0.5 * w_cmod_ytc * dy1 * dy1
-    weighted_dpp_1pct_up_YTW_bonds[instrument_id] = -w_dmod_ytw * dy1 + 0.5 * w_cmod_ytw * dy1 * dy1
-    weighted_dpp_1pct_down_YTW_bonds[instrument_id] = w_dmod_ytw * dy1 + 0.5 * w_cmod_ytw * dy1 * dy1
+    weighted_dpp_1pct_up_YTM_bonds[instrument_id], weighted_dpp_1pct_down_YTM_bonds[instrument_id] = _dpp(w_dmod_ytm, w_cmod_ytm)
+    weighted_dpp_1pct_up_YTC_bonds[instrument_id], weighted_dpp_1pct_down_YTC_bonds[instrument_id] = _dpp(w_dmod_ytc, w_cmod_ytc)
+    weighted_dpp_1pct_up_YTW_bonds[instrument_id], weighted_dpp_1pct_down_YTW_bonds[instrument_id] = _dpp(w_dmod_ytw, w_cmod_ytw)
 
     notify_data_changed(instrument_id)
 
@@ -7827,6 +8108,11 @@ weighted_dpp_1pct_up_YTW_bonds, weighted_dpp_1pct_down_YTW_bonds = {}, {}
 volume_bonds = historic_volume_request()
 
 last_price_bonds = historic_prices_request()
+
+# страховка: если какие-то uid остались без цены/объёма — задаём дефолты
+for uid in uid_bonds:
+    last_price_bonds.setdefault(uid, None)
+    volume_bonds.setdefault(uid, 0)
 
 # ====================== ENGINE scheduler (streams pause) ======================
 
