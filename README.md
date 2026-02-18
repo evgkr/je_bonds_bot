@@ -1,56 +1,106 @@
-## Setup Guide
-You will need to install <a href="https://www.python.org/downloads/">Python</a> to run this bot. This setup guide is for windows users since Linux users will probably be able to figure things out on their own.
+# Bond Screener Telegram Bot (Tinkoff Invest API)
 
-### 1. Open command line using Win + R hotkey
+Интерактивный Telegram‑бот + «движок» данных, который собирает список **рублёвых облигаций** из Tinkoff Invest API, подтягивает доп. атрибуты (кредитный рейтинг, оферты/колл‑опционы), считает ключевые метрики и показывает их в виде **живого скринера** в Telegram.
 
-### 2. Type in <i>cmd</i> and press Enter
+Проект рассчитан на запуск как **одного файла**: `v2301_main.py`.
 
-### 3. Clone the repository
+---
+
+## Что умеет
+
+- **Живой скринер облигаций в Telegram** с инлайн‑кнопками и обновлением данных.
+- Метрики по облигациям (для разных сценариев):
+  - Доходности: **YTM / YTC / YTW** (и версии **(w)**).
+  - Дюрации: **Macaulay / Modified** (и версии **(w)**, и «по сценарию» `@YTM/@YTC/@YTW`).
+  - Чувствительность цены: **ΔP при снижении доходности на 1%** (и версии **(w)**, и по сценарию).
+  - Сроки: до погашения / оферты / worst‑сценария.
+  - Ликвидность: объём торгов, объём в ₽, доля объёма к выпуску, размер выпуска в ₽.
+  - Атрибуты: сектор, страна риска, кол-во купонов в год, наличие оферты и т.д.
+- **Фильтры** по доходностям/дюрациям/ΔP/срокам/цене/объёму/размеру выпуска/рейтингу/сектору/стране/купонам/офертам.
+- **Сортировка** по любому из поддерживаемых полей (Asc/Desc) + переключение «взвешенных» метрик.
+- **Группировка** результатов (например, по сектору/рейтингу/стране/оферте/сроковым бакетам/размеру выпуска).
+- **Настройка колонок** (какие поля показывать в таблице) + готовые **пресеты** под desktop/phone.
+- **Watchlist / Blacklist** со страницами и навигацией.
+- **Алерты**: мастер создания условий + уведомления/дайджест по событиям.
+- Ссылки на карточки облигаций в Тинькофф (кликабельные `Name`/`Ticker`).
+
+---
+
+## Как это работает (в двух словах)
+
+1. Скрипт собирает список инструментов (облигации) через Tinkoff Invest API.
+2. Парсит Smart‑Lab для рейтингов и дат оферт/колл‑опционов (если есть).
+3. Строит денежные потоки по купонам и считает XIRR‑метрики (YTM/YTC/YTW) и производные показатели.
+4. Поднимает стримы MarketData (цены/объёмы) и обновляет глобальные словари с данными.
+5. Telegram‑часть (aiogram) отображает скринер и реагирует на кнопки/команды, а также пересчитывает алерты.
+
+> В коде заложен планировщик «движка»: ночью стримы ставятся на паузу, а утром происходит refresh.
+
+---
+
+## Требования
+
+- Python **3.10+** (aiogram v3).  
+- Токены:
+  - `INVEST_TOKEN` (Tinkoff Invest API)
+  - `TELEGRAM_BOT_TOKEN` (если хотите включить Telegram‑интерфейс)
+
+---
+
+## Установка
+
 ```bash
-git clone https://github.com/evgkr/je_bonds_bot.git
-```
+git clone <ваш-репозиторий>
+cd <ваш-репозиторий>
 
-### 4. Navigate to the project directory
-```bash
-cd je_bonds_bot
-```
+python -m venv .venv
+# Linux/macOS:
+source .venv/bin/activate
+# Windows:
+# .venv\Scripts\activate
 
-### 5. Install <i>virtualenv</i> package
-```bash
-pip install virtualenv
-```
-
-### 6. Create & activate <i>virtualenv</i>
-```bash
-virtualenv myenv
-```
-
-For Windows 10:
-```bash
-cd myenv/Scripts
-```
-```bash
-activate
-```
-
-For Windows 11:
-```bash
-myenv/Scripts/activate
-```
-
-### 7. Install project dependencies
-```bash
 pip install -r requirements.txt
 ```
 
-### 8. Create .env file
-```bash
-copy tokenAPI .env
+---
+
+## Конфигурация токенов
+
+В текущей версии скрипт ждёт локальный модуль `tokenAPI.py`.
+
+Создайте файл `tokenAPI.py` рядом с `v2301_main.py`:
+
+```python
+# tokenAPI.py
+token = "PASTE_TINKOFF_INVEST_TOKEN_HERE"
+bottoken = "PASTE_TELEGRAM_BOT_TOKEN_HERE"  # можно оставить пустым, чтобы отключить бота
 ```
 
-### 9. Open .env file and paste your tinkoff & telegram tokens
+## Запуск
 
-### 10. Start the app
 ```bash
-python bonds_project_main.py
+python v2301_main.py
 ```
+
+- Если `bottoken` задан, бот поднимется в фоне (в отдельном thread) и станет доступен в Telegram.
+- Если `bottoken` пустой/не задан, будет работать только «движок» данных (без Telegram UI).
+
+---
+
+## Команды бота
+
+- `/start` — краткая подсказка
+- `/screener` или `/sc` — запустить живой скринер
+- `/alerts` (`/alert`, `/al`) — управление алертами
+- `/wl` (`/watchlist`) — показать/редактировать watchlist
+- `/bl` (`/blacklist`) — показать/редактировать blacklist
+
+---
+
+## Ограничения и дисклеймер
+
+- Это **не инвестиционная рекомендация**. Вы используете метрики на свой риск.
+- Парсинг Smart‑Lab может ломаться при изменениях верстки/ограничениях доступа.
+- Скрипт монолитный (всё в одном файле). Для прод‑развёртывания стоит вынести конфиг, логи и окружение отдельно.
+
+---
