@@ -1,8 +1,8 @@
-# Bond Screener Telegram Bot (Tinkoff Invest API)
+# Bond Screener Telegram Bot (T-Invest API)
 
-Интерактивный Telegram‑бот + «движок» данных, который собирает список **рублёвых облигаций** из Tinkoff Invest API, подтягивает доп. атрибуты (кредитный рейтинг, оферты/колл‑опционы), считает ключевые метрики и показывает их в виде **живого скринера** в Telegram.
+Интерактивный Telegram‑бот + «движок» данных, который собирает список **рублёвых облигаций** из T-Invest API, подтягивает доп. атрибуты (кредитный рейтинг, оферты/колл‑опционы), считает ключевые метрики и показывает их в виде **живого скринера** в Telegram.
 
-Проект рассчитан на запуск как **одного файла**: `v2301_main.py`.
+Проект рассчитан на запуск как **одного файла**: `bonds_project_main.py`.
 
 ---
 
@@ -28,7 +28,7 @@
 
 ## Как это работает (в двух словах)
 
-1. Скрипт собирает список инструментов (облигации) через Tinkoff Invest API.
+1. Скрипт собирает список инструментов (облигации) через T-Invest API.
 2. Парсит Smart‑Lab для рейтингов и дат оферт/колл‑опционов (если есть).
 3. Строит денежные потоки по купонам и считает XIRR‑метрики (YTM/YTC/YTW) и производные показатели.
 4. Поднимает стримы MarketData (цены/объёмы) и обновляет глобальные словари с данными.
@@ -40,9 +40,9 @@
 
 ## Требования
 
-- Python **3.10+** (aiogram v3).  
+- Python **3.11** (aiogram v3).
 - Токены:
-  - `INVEST_TOKEN` (Tinkoff Invest API)
+  - `INVEST_TOKEN` (T-Invest API)
   - `TELEGRAM_BOT_TOKEN` (если хотите включить Telegram‑интерфейс)
 
 ---
@@ -68,18 +68,19 @@ pip install -r requirements.txt
 
 В текущей версии скрипт ждёт локальный модуль `tokenAPI.py`.
 
-Создайте файл `tokenAPI.py` рядом с `v2301_main.py`:
+Создайте файл `tokenAPI.py` рядом с `bonds_project_main.py`:
 
 ```python
 # tokenAPI.py
 token = "PASTE_TINKOFF_INVEST_TOKEN_HERE"
 bottoken = "PASTE_TELEGRAM_BOT_TOKEN_HERE"  # можно оставить пустым, чтобы отключить бота
+TG_PROXY = None  # optional Telegram proxy
 ```
 
 ## Запуск
 
 ```bash
-python v2301_main.py
+python bonds_project_main.py
 ```
 
 - Если `bottoken` задан, бот поднимется в фоне (в отдельном thread) и станет доступен в Telegram.
@@ -104,3 +105,33 @@ python v2301_main.py
 - Скрипт монолитный (всё в одном файле). Для прод‑развёртывания стоит вынести конфиг, логи и окружение отдельно.
 
 ---
+## T-Bank API и TLS
+
+Бот подключается к актуальному T-Invest endpoint:
+
+`invest-public-api.tbank.ru`
+
+Для legacy SDK `tinkoff-investments==0.2.0b115` требуется доверенный Russian Trusted Root CA.
+
+Перед запуском укажите путь к PEM-сертификату:
+
+```bash
+export GRPC_DEFAULT_SSL_ROOTS_FILE_PATH=/path/to/russian_trusted_root_ca.pem
+```
+
+При запуске через systemd добавьте переменную окружения:
+
+```ini
+[Service]
+Environment=GRPC_DEFAULT_SSL_ROOTS_FILE_PATH=/path/to/russian_trusted_root_ca.pem
+```
+
+После изменения конфигурации:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart bondbot.service
+sudo journalctl -u bondbot.service -f
+```
+
+Не отключайте проверку TLS.

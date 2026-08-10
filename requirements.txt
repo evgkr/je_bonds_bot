@@ -1,18 +1,9 @@
-# Core
-tinkoff-investments>=0.2.0
-aiogram>=3.0,<4
-
-# Data / parsing
-requests>=2.31
-beautifulsoup4>=4.12
-lxml>=4.9
-
-# Utils
-tqdm>=4.66
-pyxirr>=0.10
-
-# gRPC (used directly in code via grpc.aio)
-grpcio>=1.60
-
-# Time zones (helps on Windows / slim Docker images)
+tinkoff-investments==0.2.0b115
+aiogram==3.26.0
+requests==2.33.1
+beautifulsoup4==4.14.3
+lxml==6.0.2
+tqdm==4.67.3
+pyxirr==0.10.8
+grpcio==1.74.0
 tzdata>=2024.1
