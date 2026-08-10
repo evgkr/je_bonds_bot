@@ -1,8 +1,10 @@
 from tinkoff.invest import MarketDataRequest,AsyncClient, SubscriptionAction, Client, CandleInstrument, CandleInterval, SubscribeCandlesRequest, SubscriptionInterval, GetMySubscriptions, SubscriptionStatus
+
+TBANK_GRPC_TARGET = "invest-public-api.tbank.ru"
 import tokenAPI
 from datetime import date, datetime, timedelta
 from bs4 import BeautifulSoup as bs
-from tokenAPI import bottoken
+from tokenAPI import bottoken, TG_PROXY
 from tqdm import tqdm
 import requests
 import math
@@ -29,6 +31,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
+from aiogram.client.session.aiohttp import AiohttpSession
 import copy
 
 token = tokenAPI.token
@@ -213,6 +216,7 @@ class ScreenerState:
     # служебное
     active: bool = False
     chat_id: Optional[int] = None
+    thread_id: Optional[int] = None
     message_id: Optional[int] = None
     last_render_hash: Optional[int] = None
     last_edit_ts: float = 0.0
@@ -224,6 +228,9 @@ class ScreenerState:
     render_seq: int = 0
     awaiting_input: Optional[str] = None
     prompt_msg_id: Optional[int] = None
+    input_chat_id: Optional[int] = None
+    input_thread_id: Optional[int] = None
+    input_message_id: Optional[int] = None
     list_view_msg_id: Optional[int] = None
     list_view_kind: Optional[str] = None
     list_page_idx: int = 0
@@ -250,6 +257,169 @@ class ScreenerState:
 USER_STATES: Dict[int, ScreenerState] = {}
 
 
+def _thread_id_from_message(msg: Optional[Message]) -> int:
+    return int(getattr(msg, "message_thread_id", None) or 0)
+
+
+def _message_matches_binding(
+    msg: Optional[Message],
+    chat_id: Optional[int],
+    message_id: Optional[int],
+    thread_id: Optional[int] = None
+) -> bool:
+    if not msg or chat_id is None or message_id is None:
+        return False
+
+    if msg.chat.id != chat_id or msg.message_id != message_id:
+        return False
+
+    # message_id уже уникален в пределах чата.
+    # topic/thread проверяем только если Telegram прислал thread_id и в биндинге, и в callback.
+    bound_thread_id = int(thread_id or 0)
+    current_thread_id = _thread_id_from_message(msg)
+
+    if bound_thread_id and current_thread_id and current_thread_id != bound_thread_id:
+        return False
+
+    return True
+
+
+def _bind_screener_message(st: ScreenerState, msg: Optional[Message]):
+    if not msg:
+        return
+    st.chat_id = msg.chat.id
+    st.thread_id = _thread_id_from_message(msg)
+
+
+def _bind_screener_input(st: ScreenerState, msg: Optional[Message], prompt_msg_id: Optional[int] = None):
+    if not msg:
+        return
+    st.input_chat_id = msg.chat.id
+    st.input_thread_id = _thread_id_from_message(msg)
+    st.input_message_id = msg.message_id
+    if prompt_msg_id is not None:
+        st.prompt_msg_id = prompt_msg_id
+
+
+def _clear_screener_input(st: ScreenerState):
+    st.awaiting_input = None
+    st.prompt_msg_id = None
+    st.input_chat_id = None
+    st.input_thread_id = None
+    st.input_message_id = None
+
+
+def _screener_input_matches(st: ScreenerState, msg: Optional[Message]) -> bool:
+    if not st.awaiting_input:
+        return False
+    if st.input_chat_id is None:
+        return True
+    if not msg or msg.chat.id != st.input_chat_id:
+        return False
+    return _thread_id_from_message(msg) == int(st.input_thread_id or 0)
+
+
+def _bind_alerts_ui(ui: "AlertsUIState", msg: Optional[Message]):
+    if not msg:
+        return
+    ui.chat_id = msg.chat.id
+    ui.thread_id = _thread_id_from_message(msg)
+
+
+def _sync_alerts_input_scope(ui: "AlertsUIState", msg: Optional[Message]):
+    if ui.awaiting and msg:
+        ui.input_chat_id = msg.chat.id
+        ui.input_thread_id = _thread_id_from_message(msg)
+    elif not ui.awaiting:
+        ui.input_chat_id = None
+        ui.input_thread_id = None
+
+
+def _alerts_input_matches(ui: "AlertsUIState", msg: Optional[Message]) -> bool:
+    if not ui.awaiting:
+        return False
+    if ui.input_chat_id is None:
+        return True
+    if not msg or msg.chat.id != ui.input_chat_id:
+        return False
+    return _thread_id_from_message(msg) == int(ui.input_thread_id or 0)
+
+
+class CallbackBindingMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        q = event
+        msg = getattr(q, "message", None)
+        cb = getattr(q, "data", None) or ""
+        if not msg:
+            return await handler(event, data)
+
+        uid = q.from_user.id
+
+        if cb.startswith(("menu:", "nav:", "sortcat:", "sort:set:", "group:", "filtercat:", "preset:", "filter:", "settings:", "fields_cat:", "fields:")):
+            st = USER_STATES.get(uid)
+            if st and st.message_id is not None and not _message_matches_binding(msg, st.chat_id, st.message_id, st.thread_id):
+                try:
+                    await _safe_cb_answer(q, "Используйте кнопки под своим сообщением.", show_alert=False)
+                except Exception:
+                    pass
+                return
+
+        if cb in {"wl:add", "wl:del", "bl:add", "bl:del"}:
+            st = USER_STATES.get(uid)
+            expected_id = st.wl_view_msg_id if cb.startswith("wl:") else st.bl_view_msg_id if st else None
+            if st and expected_id is not None and not _message_matches_binding(msg, msg.chat.id, expected_id):
+                try:
+                    await _safe_cb_answer(q, "Используйте кнопки под своим сообщением.", show_alert=False)
+                except Exception:
+                    pass
+                return
+
+        if cb.startswith("listnav:"):
+            st = USER_STATES.get(uid)
+            which = (cb.split(":", 2)[1] if cb.count(":") >= 2 else "")
+            expected_id = None
+            if st:
+                expected_id = st.wl_view_msg_id if which == "wl" else st.bl_view_msg_id if which == "bl" else None
+            if st and expected_id is not None and not _message_matches_binding(msg, msg.chat.id, expected_id):
+                try:
+                    await _safe_cb_answer(q, "Используйте кнопки под своим сообщением.", show_alert=False)
+                except Exception:
+                    pass
+                return
+
+        if cb.startswith("alerts:") and not cb.startswith("alerts:close:"):
+            ui = ALERT_UI.get(uid)
+            if ui and ui.message_id is not None and not _message_matches_binding(msg, ui.chat_id, ui.message_id, ui.thread_id):
+                try:
+                    await _safe_cb_answer(q, "Используйте кнопки под своим сообщением.", show_alert=False)
+                except Exception:
+                    pass
+                return
+
+        if cb.startswith("adg:"):
+            key = (msg.chat.id, msg.message_id)
+            if key not in _ALERTS_DIGEST_VIEW.get(uid, {}):
+                try:
+                    await _safe_cb_answer(q, "Используйте кнопки под своим сообщением.", show_alert=False)
+                except Exception:
+                    pass
+                return
+
+        return await handler(event, data)
+
+async def _safe_cb_answer(q: CallbackQuery, *args, **kwargs):
+    try:
+        await q.answer(*args, **kwargs)
+    except TelegramBadRequest as e:
+        s = str(e).lower()
+        if (
+            "query is too old" in s
+            or "query id is invalid" in s
+            or "response timeout expired" in s
+        ):
+            print(f"[{_ts()}] ⚠️ stale callback ignored: {e}")
+            return
+        raise
 
 async def _idle_return_worker(bot: Bot, uid: int):
     state = USER_STATES.get(uid)
@@ -353,10 +523,13 @@ class IdleTouchMiddleware(BaseMiddleware):
         q = event  # CallbackQuery
         st = USER_STATES.get(q.from_user.id)
         if st:
-            if not st.chat_id and q.message:
-                st.chat_id = q.message.chat.id
-            if not st.message_id and q.message:
-                st.message_id = q.message.message_id
+            if q.message:
+                if st.chat_id is None:
+                    st.chat_id = q.message.chat.id
+                if st.thread_id is None:
+                    st.thread_id = _thread_id_from_message(q.message)
+                if st.message_id is None:
+                    st.message_id = q.message.message_id
             touch_idle_timer(self.bot, q.from_user.id)
         return await handler(event, data)
 
@@ -1756,9 +1929,16 @@ def current_markup(state: ScreenerState) -> InlineKeyboardMarkup:
     return main_keyboard(state)
 
 # ====================== Редактирование одного сообщения ======================
-bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+
+session = AiohttpSession(proxy=TG_PROXY)
+bot = Bot(
+    BOT_TOKEN,
+    session=session,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+)
 dp = Dispatcher()
 dp.callback_query.middleware(IdleTouchMiddleware(bot))
+dp.callback_query.middleware(CallbackBindingMiddleware())
 
 def _screener_kb_sig(markup: Optional[InlineKeyboardMarkup]) -> Any:
     if not markup:
@@ -2019,11 +2199,11 @@ async def rerender_all_active():
 
 def _awaiting_list_edit(m: Message) -> bool:
     st = USER_STATES.setdefault(m.from_user.id, ScreenerState())
-    return (st.awaiting_input or "").startswith(("wl:", "bl:"))
+    return (st.awaiting_input or "").startswith(("wl:", "bl:")) and _screener_input_matches(st, m)
 
 def _awaiting_preset_save(m: Message) -> bool:
     st = USER_STATES.get(m.from_user.id)
-    return bool(st and st.awaiting_input == "preset_save")
+    return bool(st and st.awaiting_input == "preset_save" and _screener_input_matches(st, m))
 
 import time as _time
 
@@ -2045,7 +2225,10 @@ def _alerts_next_id(uid: int) -> int:
 @dataclass
 class AlertsUIState:
     chat_id: Optional[int] = None
+    thread_id: Optional[int] = None
     message_id: Optional[int] = None
+    input_chat_id: Optional[int] = None
+    input_thread_id: Optional[int] = None
     screen: str = "root"         # root | manage | select_num | mute | rename
     selected_idx: int = 0
     mute_until: Optional[float] = None
@@ -2142,9 +2325,9 @@ def _alerts_manage_kb() -> InlineKeyboardMarkup:
     kb.adjust(2, 1, 3, 2)
     return kb.as_markup()
 
-def _alerts_close_kb() -> InlineKeyboardMarkup:
+def _alerts_close_kb(owner_uid: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    kb.button(text="✖️ Close", callback_data="alerts:close")
+    kb.button(text="✖️ Close", callback_data=f"alerts:close:{owner_uid}")
     kb.adjust(1)
     return kb.as_markup()
 
@@ -2810,6 +2993,7 @@ def _awz_draft_from_rule(uid: int, r: AlertRule) -> AlertWizardDraft:
     return d
 
 def _awz_write_to_rule(uid: int, d: AlertWizardDraft, r: AlertRule):
+    ui = _alerts_ui(uid)
     user_name = (d.name or "").strip()
     if user_name:
         name = user_name
@@ -2848,6 +3032,7 @@ def _awz_write_to_rule(uid: int, d: AlertWizardDraft, r: AlertRule):
         "conditions": conds_out,
         "expr": d.expr_tokens,
         "trigger": {"kind": d.trigger_kind, "time": d.digest_time, "weekday": d.digest_weekday},
+        "delivery": {"chat_id": ui.chat_id or uid, "thread_id": ui.thread_id},
     }
 
 
@@ -3724,6 +3909,36 @@ async def _alerts_flush_pending(uid: int):
         # задача отработала
         ui.pending_task = None
 
+async def _alerts_soft_stop(ui: AlertsUIState):
+    old_chat_id = ui.chat_id
+    old_message_id = ui.message_id
+
+    # убираем кнопки у старого alerts-сообщения
+    if old_chat_id and old_message_id:
+        try:
+            await bot.edit_message_reply_markup(
+                chat_id=old_chat_id,
+                message_id=old_message_id,
+                reply_markup=None
+            )
+        except TelegramBadRequest:
+            pass
+        except Exception:
+            pass
+
+    # гасим хвосты отложенных апдейтов
+    if ui.pending_task and not ui.pending_task.done():
+        ui.pending_task.cancel()
+
+    ui.pending_task = None
+    ui.pending_text = None
+    ui.pending_markup = None
+    ui.pending_due_ts = 0.0
+    ui.last_render_hash = None
+    ui.last_edit_ts = 0.0
+
+    # отвязываем старое сообщение
+    ui.message_id = None
 
 async def _alerts_edit(uid: int, text: str, markup: InlineKeyboardMarkup):
     ui = _alerts_ui(uid)
@@ -3815,18 +4030,33 @@ async def _alerts_edit(uid: int, text: str, markup: InlineKeyboardMarkup):
             ui.pending_task = asyncio.create_task(_alerts_flush_pending(uid))
             return
 
-async def _alerts_send_message(uid: int, text: str, kb: Optional[InlineKeyboardMarkup] = None):
-    """Глобальный sender для engine (не вложенный!). Возвращает Message или None."""
+async def _alerts_send_message(chat_id: int, text: str, kb: Optional[InlineKeyboardMarkup] = None, message_thread_id: Optional[int] = None):
+    """Глобальный sender для engine. Возвращает Message или None."""
+    kwargs = {"chat_id": chat_id, "text": text, "reply_markup": kb}
+    if message_thread_id:
+        kwargs["message_thread_id"] = int(message_thread_id)
     try:
         if "LP_DISABLED" in globals():
-            return await bot.send_message(uid, text, reply_markup=kb, link_preview_options=LP_DISABLED, parse_mode="HTML")
-        return await bot.send_message(uid, text, reply_markup=kb, parse_mode="HTML")
+            return await bot.send_message(**kwargs, link_preview_options=LP_DISABLED, parse_mode="HTML")
+        return await bot.send_message(**kwargs, parse_mode="HTML")
     except Exception:
         try:
-            # fallback без parse_mode/preview
-            return await bot.send_message(uid, text, reply_markup=kb)
+            return await bot.send_message(**kwargs)
         except Exception:
             return None
+
+
+def _alerts_delivery_target(uid: int, rule: Any) -> Tuple[int, Optional[int]]:
+    cfg = _alerts_cfg(rule)
+    delivery = (cfg.get("delivery") or {}) if isinstance(cfg, dict) else {}
+    chat_id = delivery.get("chat_id") if isinstance(delivery, dict) else None
+    thread_id = delivery.get("thread_id") if isinstance(delivery, dict) else None
+    return int(chat_id or uid), (int(thread_id) if thread_id else None)
+
+
+async def _alerts_send_for_rule(uid: int, rule: Any, text: str, kb: Optional[InlineKeyboardMarkup] = None):
+    chat_id, thread_id = _alerts_delivery_target(uid, rule)
+    return await _alerts_send_message(chat_id, text, kb=kb, message_thread_id=thread_id)
 
 # ====================== ALERTS (stage 5: engine + notifications) ======================
 
@@ -3847,8 +4077,8 @@ ALERT_REPEAT_COOLDOWN_SEC = 300  # 5 минут
 # uid -> alert_id -> bond_uid -> ts_until
 _ALERTS_REPEAT_COOLDOWN: Dict[int, Dict[int, Dict[str, float]]] = defaultdict(lambda: defaultdict(dict))
 
-# user -> message_id -> {"pages": [str], "page_idx": int}
-_ALERTS_DIGEST_VIEW: Dict[int, Dict[int, Dict[str, Any]]] = defaultdict(dict)
+# user -> (chat_id, message_id) -> {"pages": [str], "page_idx": int}
+_ALERTS_DIGEST_VIEW: Dict[int, Dict[Tuple[int, int], Dict[str, Any]]] = defaultdict(dict)
 
 ALERTS_DIGEST_PAGE_CAP = 22  # максимум облигаций на страницу
 
@@ -4602,9 +4832,9 @@ async def _alerts_primary_check_after_save(uid: int, rule: Any, now_msk: datetim
     label_html = html.escape(getattr(rule, "label", f"Alert {alert_id}"), quote=False)
     pages = _alerts_build_primary_check_pages(label_html, now_msk, items)
 
-    msg = await _alerts_send_message(uid, pages[0], _alerts_digest_nav_kb(0, len(pages)))
+    msg = await _alerts_send_for_rule(uid, rule, pages[0], _alerts_digest_nav_kb(0, len(pages)))
     if msg:
-        _ALERTS_DIGEST_VIEW[uid][msg.message_id] = {"pages": pages, "page_idx": 0}
+        _ALERTS_DIGEST_VIEW[uid][(msg.chat.id, msg.message_id)] = {"pages": pages, "page_idx": 0}
         for it in items:
             _alerts_mark_shown(uid, alert_id, it["uid"])
 
@@ -4718,7 +4948,7 @@ async def _alerts_process_bucket(now_msk: datetime, force: bool = False):
                         msg_lines.append("🔹 (couldn't determine)")
 
                     txt = "\n".join(msg_lines)
-                    msg = await _alerts_send_message(uid, "\n".join(msg_lines), _alerts_close_kb())
+                    msg = await _alerts_send_for_rule(uid, rule, "\n".join(msg_lines), _alerts_close_kb(uid))
                     if msg:
                         _alerts_mark_shown(uid, alert_id, buid)
 
@@ -4828,12 +5058,12 @@ async def _alerts_process_digests(now_msk: datetime):
             label_html = html.escape(getattr(rule, "label", f"Alert {alert_id}"), quote=False)
             pages = _alerts_build_digest_snapshot_pages(label_html, now_msk, items)
 
-            msg = await _alerts_send_message(uid, pages[0], _alerts_digest_nav_kb(0, len(pages)))
+            msg = await _alerts_send_for_rule(uid, rule, pages[0], _alerts_digest_nav_kb(0, len(pages)))
             if msg:
-                _ALERTS_DIGEST_VIEW[uid][msg.message_id] = {"pages": pages, "page_idx": 0}
+                _ALERTS_DIGEST_VIEW[uid][(msg.chat.id, msg.message_id)] = {"pages": pages, "page_idx": 0}
                 for it in items:
                     _alerts_mark_shown(uid, alert_id, it["uid"])
-                    
+
             _ALERTS_DIGEST_SENT[uid][alert_id] = token
 
 async def alerts_engine_loop():
@@ -4866,33 +5096,35 @@ async def on_alert_notification_cb(q: CallbackQuery):
     parts = (q.data or "").split(":")
     # alntf:open:ID / alntf:toggle:ID / alntf:manage:ID
     if len(parts) != 3:
-        await q.answer()
+        await _safe_cb_answer(q)
         return
 
     action = parts[1]
     try:
         alert_id = int(parts[2])
     except Exception:
-        await q.answer()
+        await _safe_cb_answer(q)
         return
 
     rules = ALERT_RULES.get(uid) or []
     rule = next((r for r in rules if getattr(r, "alert_id", None) == alert_id), None)
     if not rule:
-        await q.answer("Alert not found", show_alert=False)
+        await _safe_cb_answer(q, "Alert not found", show_alert=False)
         return
 
     if action == "toggle":
         rule.enabled = not getattr(rule, "enabled", True)
-        await q.answer("Done")
+        await _safe_cb_answer(q, "Done")
         return
 
     if action == "manage":
         # переносим пользователя в /alerts -> manage (в том же сообщении /alerts)
         ui = _alerts_ui(uid)  # твой UI-стейт алертов
-        ui.chat_id = q.message.chat.id if q.message else ui.chat_id
+        if q.message:
+            _bind_alerts_ui(ui, q.message)
         ui.screen = "manage"
         ui.selected_idx = max(0, next((i for i, r in enumerate(rules) if getattr(r, "alert_id", None) == alert_id), 0))
+        await _safe_cb_answer(q)
         text, kb = _alerts_render_manage(uid)
         if ui.message_id and ui.chat_id:
             await _alerts_edit(uid, text, kb)
@@ -4900,7 +5132,6 @@ async def on_alert_notification_cb(q: CallbackQuery):
             msg = await q.message.answer(text, reply_markup=kb, link_preview_options=LP_DISABLED)
             ui.chat_id = msg.chat.id
             ui.message_id = msg.message_id
-        await q.answer()
         return
 
     if action == "open":
@@ -4909,7 +5140,7 @@ async def on_alert_notification_cb(q: CallbackQuery):
         data = snapshot_data()
         logic, conds = _alerts_conditions_from_cfg(cfg)
         if not conds:
-            await q.answer("Нет условий", show_alert=False)
+            await _safe_cb_answer(q, "Нет условий", show_alert=False)
             return
 
         scope_uids = _alerts_scope_uids(uid, cfg, data)
@@ -4926,7 +5157,7 @@ async def on_alert_notification_cb(q: CallbackQuery):
         uids_to_show = [r["uid"] for r in matched]
 
         if not uids_to_show:
-            await q.answer("No securities matching this alert right now.", show_alert=False)
+            await _safe_cb_answer(q, "No securities matching this alert right now.", show_alert=False)
             return
 
         st = USER_STATES.setdefault(uid, ScreenerState())
@@ -4951,11 +5182,11 @@ async def on_alert_notification_cb(q: CallbackQuery):
         st.scope_uids = set(uids_to_show)
         st.filters = FilterState()  # чтобы показать все matched без ограничений
 
+        await _safe_cb_answer(q)
         await safe_send_initial(q.message, st)
-        await q.answer()
         return
 
-    await q.answer()
+    await _safe_cb_answer(q)
 
 def _alerts_apply_screen(uid: int) -> tuple[str, InlineKeyboardMarkup]:
     ui = _alerts_ui(uid)
@@ -4987,6 +5218,8 @@ async def _alerts_try_consume_text(m: Message) -> bool:
     ui = ALERT_UI.get(uid)
     if ui:
         ui.busy_until = time.time() + 2.0
+        if ui.awaiting and not _alerts_input_matches(ui, m):
+            return False
 
     # ===== alerts wizard input consume =====
     if ui and ui.screen.startswith("aw_"):
@@ -5010,6 +5243,7 @@ async def _alerts_try_consume_text(m: Message) -> bool:
             else:
                 ui.screen = "aw_step1"
 
+            _sync_alerts_input_scope(ui, m)
             text, kb = _alerts_apply_screen(uid)
             await _alerts_edit(uid, text, kb)
             try:
@@ -5379,13 +5613,12 @@ async def cmd_cutoff_test(m: Message):
     # 3) иначе — через FindInstrument (для ISIN тоже)
     if uid is None:
         try:
-            with Client(token) as client:
+            with Client(token, target=TBANK_GRPC_TARGET) as client:
                 fn = getattr(client.instruments, "find_instrument", None)
                 if fn is None:
                     raise RuntimeError("find_instrument not found in SDK")
                 r = fn(query=q)
                 insts = getattr(r, "instruments", []) or []
-                # пытаемся выбрать bond
                 pick = None
                 for inst in insts:
                     kind = getattr(inst, "instrument_kind", None) or getattr(inst, "kind", None)
@@ -5402,11 +5635,12 @@ async def cmd_cutoff_test(m: Message):
         await m.answer("Не смог определить облигацию по этому вводу. Попробуй тикер из списка бота или instrument_uid.")
         return
 
+    buy_day = get_purchase_day().date()
     settle = get_settlement_day().date()
 
-    # берём ближайший купон и его fix_date
+    # берём будущие купоны и их fix_date
     try:
-        with Client(token) as client:
+        with Client(token, target=TBANK_GRPC_TARGET) as client:
             r = client.instruments.get_bond_coupons(
                 instrument_id=uid,
                 from_=datetime.today() - timedelta(days=30),
@@ -5422,21 +5656,41 @@ async def cmd_cutoff_test(m: Message):
 
     today = date.today()
 
-    future = [ev for ev in r.events
-              if getattr(ev, "coupon_date", None) and ev.coupon_date.date() >= today]
+    future = sorted(
+        [ev for ev in r.events if getattr(ev, "coupon_date", None) and ev.coupon_date.date() >= today],
+        key=lambda ev: ev.coupon_date
+    )
 
     if not future:
         await m.answer("Не нашёл ближайший будущий купон (в горизонте года).")
         return
 
-    # берём реально ближайший
-    nxt = min(future, key=lambda ev: ev.coupon_date)
-
+    # просто ближайший календарно купон
+    nxt = future[0]
     coupon_date = nxt.coupon_date.date()
     fix_date = _pb_to_date(getattr(nxt, "fix_date", None))
     pay = nxt.pay_one_bond.units + (nxt.pay_one_bond.nano * 10 ** (-9))
 
     eligible = (fix_date is None) or (fix_date >= settle)
+
+    # первый реально достижимый купон для покупки сейчас
+    reachable = None
+    for ev in future:
+        ev_fix = _pb_to_date(getattr(ev, "fix_date", None))
+        if ev_fix is None or ev_fix >= settle:
+            reachable = ev
+            break
+
+    reachable_txt = "\n\nПервый реально достижимый купон в горизонте года не найден."
+    if reachable is not None:
+        r_coupon_date = reachable.coupon_date.date()
+        r_fix_date = _pb_to_date(getattr(reachable, "fix_date", None))
+        r_pay = reachable.pay_one_bond.units + (reachable.pay_one_bond.nano * 10 ** (-9))
+        reachable_txt = (
+            f"\n\nПервый реально достижимый купон для покупки сейчас: "
+            f"<b>{r_coupon_date.strftime('%d.%m.%Y')}</b>, {r_pay:.2f} ₽\n"
+            f"fix_date этого купона: <b>{r_fix_date.strftime('%d.%m.%Y') if r_fix_date else '— (нет в API)'}</b>"
+        )
 
     ticker = ticker_bonds.get(uid, "—")
     name = name_bonds.get(uid, "—")
@@ -5445,11 +5699,13 @@ async def cmd_cutoff_test(m: Message):
         f"🧪 <b>cutoff_test</b>\n"
         f"<b>{html.escape(str(name))}</b> ({html.escape(str(ticker))})\n"
         f"uid: <code>{html.escape(uid)}</code>\n\n"
-        f"Расчётный день покупки сегодня (T+1): <b>{settle.strftime('%d.%m.%Y')}</b>\n"
-        f"Ближайший купон: <b>{coupon_date.strftime('%d.%m.%Y')}</b>, {pay:.2f} ₽\n"
+        f"Ближайший реальный день покупки: <b>{buy_day.strftime('%d.%m.%Y')}</b>\n"
+        f"Расчётный день этой покупки (T+1): <b>{settle.strftime('%d.%m.%Y')}</b>\n\n"
+        f"Ближайший купон по календарю: <b>{coupon_date.strftime('%d.%m.%Y')}</b>, {pay:.2f} ₽\n"
         f"fix_date (фиксация реестра): <b>{fix_date.strftime('%d.%m.%Y') if fix_date else '— (нет в API)'}</b>\n\n"
-        f"По логике бота купон при покупке сегодня: "
+        f"Этот ближайший купон при покупке сейчас: "
         f"{'<b>УЧИТЫВАЕТСЯ</b>' if eligible else '<b>НЕ учитывается</b>'}"
+        f"{reachable_txt}"
     )
     await m.answer(txt)
 
@@ -5477,13 +5733,29 @@ async def cmd_bl(m: Message):
 async def cmd_alerts(m: Message):
     uid = m.from_user.id
     ui = ALERT_UI.setdefault(uid, AlertsUIState())
+
+    target_chat_id = m.chat.id
+    target_thread_id = _thread_id_from_message(m)
+
+    # сбрасываем мастер в root
     ui.screen = "root"
     ui.selected_idx = 0
+    ui.awaiting = None
+    ui.wizard_edit_idx = None
+    ui.input_chat_id = None
+    ui.input_thread_id = None
+    _awz_clear(uid)
 
     text, kb = _alerts_render_root(uid)
 
-    # пытаемся переиспользовать уже созданное "alerts-сообщение"
-    if ui.chat_id == m.chat.id and ui.message_id:
+    # переиспользуем только если это ТО ЖЕ место (чат + topic/thread)
+    same_place = (
+        ui.message_id is not None
+        and ui.chat_id == target_chat_id
+        and int(ui.thread_id or 0) == int(target_thread_id or 0)
+    )
+
+    if same_place:
         try:
             await bot.edit_message_text(
                 chat_id=ui.chat_id,
@@ -5492,14 +5764,23 @@ async def cmd_alerts(m: Message):
                 reply_markup=kb,
                 link_preview_options=LP_DISABLED
             )
+            ui.last_render_hash = _alerts_render_hash(text, kb)
+            ui.last_edit_ts = time.time()
             return
         except TelegramBadRequest:
             pass
 
-    msg = await m.answer(text, reply_markup=kb, link_preview_options=LP_DISABLED)
-    ui.chat_id = m.chat.id
-    ui.message_id = msg.message_id
+    # если мастер уже был где-то ещё — мягко останавливаем старый
+    if ui.message_id is not None:
+        await _alerts_soft_stop(ui)
 
+    # создаём новый alerts-master
+    msg = await m.answer(text, reply_markup=kb, link_preview_options=LP_DISABLED)
+    ui.chat_id = target_chat_id
+    ui.thread_id = target_thread_id
+    ui.message_id = msg.message_id
+    ui.last_render_hash = _alerts_render_hash(text, kb)
+    ui.last_edit_ts = time.time()
 
 @dp.callback_query(F.data.startswith("alerts:"))
 async def cb_alerts(q: CallbackQuery):
@@ -5513,20 +5794,24 @@ async def cb_alerts(q: CallbackQuery):
 
     # привязываем состояние к сообщению
     if q.message:
-        ui.chat_id = q.message.chat.id
+        _bind_alerts_ui(ui, q.message)
         ui.message_id = q.message.message_id
 
     data = (q.data or "").strip()
 
     # закрыть (удалить) уведомление-алерт
-    if data == "alerts:close":
+    if data.startswith("alerts:close:"):
+        owner_raw = data.split(":", 2)[2]
+        if owner_raw != str(uid):
+            try:
+                await _safe_cb_answer(q, "Используйте кнопки под своим сообщением.", show_alert=False)
+            except Exception:
+                pass
+            return
         try:
+            await _safe_cb_answer(q)
             if q.message:
                 await q.message.delete()
-        except Exception:
-            pass
-        try:
-            await q.answer()
         except Exception:
             pass
         return
@@ -6155,35 +6440,36 @@ async def cb_alerts(q: CallbackQuery):
     except Exception as e:
         print(f"[{_ts()}] ⚠️ alerts cb error: {e}")
 
+    # синхронизируем область ожидаемого текстового ввода
+    if q.message:
+        _sync_alerts_input_scope(ui, q.message)
+
     # обновляем UI (всё внутри одного сообщения)
     try:
+        await _safe_cb_answer(q)
         text_out, kb_out = _alerts_apply_screen(uid)
         await _alerts_edit(uid, text_out, kb_out)
     except Exception as e:
         print(f"[{_ts()}] ⚠️ alerts edit error: {e}")
-
-    try:
-        await q.answer()
-    except Exception:
-        pass
 
 @dp.callback_query(F.data.startswith("adg:"))
 async def on_alerts_digest_nav(q: CallbackQuery):
     uid = q.from_user.id
     if not q.message:
         try:
-            await q.answer()
+            await _safe_cb_answer(q)
         except Exception:
             pass
         return
 
     msg_id = q.message.message_id
-    st = _ALERTS_DIGEST_VIEW.get(uid, {}).get(msg_id)
+    view_key = (q.message.chat.id, msg_id)
+    st = _ALERTS_DIGEST_VIEW.get(uid, {}).get(view_key)
     action = (q.data.split(":", 1)[1] or "").strip()
 
     if not st or not st.get("pages"):
         try:
-            await q.answer("This digest is no longer available.")
+            await _safe_cb_answer(q, "This digest is no longer available.")
         except Exception:
             pass
         return
@@ -6194,14 +6480,12 @@ async def on_alerts_digest_nav(q: CallbackQuery):
 
     if action == "close":
         try:
+            await _safe_cb_answer(q)
             await bot.delete_message(chat_id=q.message.chat.id, message_id=msg_id)
         except Exception:
             pass
-        _ALERTS_DIGEST_VIEW[uid].pop(msg_id, None)
-        try:
-            await q.answer()
-        except Exception:
-            pass
+        _ALERTS_DIGEST_VIEW[uid].pop(view_key, None)
+
         return
 
     if action == "first":
@@ -6217,6 +6501,7 @@ async def on_alerts_digest_nav(q: CallbackQuery):
     kb = _alerts_digest_nav_kb(idx, total)
 
     try:
+        await _safe_cb_answer(q)
         await bot.edit_message_text(
             chat_id=q.message.chat.id,
             message_id=msg_id,
@@ -6227,11 +6512,6 @@ async def on_alerts_digest_nav(q: CallbackQuery):
         )
     except TelegramBadRequest:
         pass
-    except Exception:
-        pass
-
-    try:
-        await q.answer()
     except Exception:
         pass
 
@@ -6255,9 +6535,9 @@ async def on_screener(m: Message):
     # Запуск нового скринера
     st.active = True
     st.chat_id = m.chat.id
+    st.thread_id = _thread_id_from_message(m)
     st.message_id = None
-    st.awaiting_input = None
-    st.prompt_msg_id = None
+    _clear_screener_input(st)
     st.ui_mode = "main"
     _cancel_idle_timer(st)  # сбрасываем возможные «хвосты»
     st.page_idx = 0
@@ -6267,16 +6547,17 @@ async def on_screener(m: Message):
 
 @dp.message(F.text, ~F.text.startswith("/"), _awaiting_list_edit)
 async def on_list_edit_input(m: Message):
+    st = USER_STATES.setdefault(m.from_user.id, ScreenerState())
+
     # отмена операции списков
     txt = (m.text or "").strip()
     if txt.lower() == "/cancel":
-        if st and st.prompt_msg_id:
+        if st.prompt_msg_id:
             try:
                 await bot.delete_message(chat_id=m.chat.id, message_id=st.prompt_msg_id)
             except TelegramBadRequest:
                 pass
-            st.prompt_msg_id = None
-        st.awaiting_input = None
+        _clear_screener_input(st)
         # удаляем и сообщение пользователя с /cancel
         try:
             await bot.delete_message(m.chat.id, m.message_id)
@@ -6284,7 +6565,6 @@ async def on_list_edit_input(m: Message):
             pass
         return
 
-    st = USER_STATES.setdefault(m.from_user.id, ScreenerState())
     which, mode = st.awaiting_input.split(":")
     which_set = st.watchlist if which == "wl" else st.blacklist
 
@@ -6302,8 +6582,7 @@ async def on_list_edit_input(m: Message):
         await bot.delete_message(m.chat.id, m.message_id)
     except Exception:
         pass
-    st.prompt_msg_id = None
-    st.awaiting_input = None
+    _clear_screener_input(st)
 
     # точечная перерисовка WL/BL после изменения списка
     if which == "wl":
@@ -6338,6 +6617,8 @@ async def on_list_edit_input(m: Message):
 @dp.callback_query(F.data.startswith("menu:"))
 async def on_menu(q: CallbackQuery):
     st = USER_STATES.setdefault(q.from_user.id, ScreenerState())
+    if q.message:
+        _bind_screener_message(st, q.message)
     action = q.data.split(":", 1)[1]
     st.awaiting_input = None
     st.ui_mode = {
@@ -6351,12 +6632,12 @@ async def on_menu(q: CallbackQuery):
     if action == "main":
         _cancel_idle_timer(st)
     st.page_idx = 0
+    await _safe_cb_answer(q)
     await rerender_one(q.from_user.id)
-    await q.answer()
 
 @dp.callback_query(F.data == "noop")
 async def on_noop(q: CallbackQuery):
-    await q.answer()
+    await _safe_cb_answer(q)
 
 @dp.callback_query(F.data.in_({"wl:add","wl:del","bl:add","bl:del"}))
 async def on_list_edit_start(q: CallbackQuery, bot: Bot):
@@ -6366,11 +6647,14 @@ async def on_list_edit_start(q: CallbackQuery, bot: Bot):
         st.wl_view_msg_id = q.message.message_id
     else:
         st.bl_view_msg_id = q.message.message_id
-    prompt = await q.message.answer("Send ticker(s).\n"
-                                    "Separators: space/comma.\n"
-                                    "To cancel — /cancel")
-    st.prompt_msg_id = prompt.message_id
-    await q.answer()
+    await _safe_cb_answer(q)
+
+    prompt = await q.message.answer(
+        "Send ticker(s).\n"
+        "Separators: space/comma.",
+        reply_markup=prompt_cancel_keyboard()
+    )
+    _bind_screener_input(st, q.message, prompt.message_id)
 
 @dp.callback_query(F.data.startswith("listnav:"))
 async def on_list_nav(q: CallbackQuery, bot: Bot):
@@ -6378,7 +6662,7 @@ async def on_list_nav(q: CallbackQuery, bot: Bot):
     try:
         _, which, action = q.data.split(":")
     except Exception:
-        await q.answer(); return
+        await _safe_cb_answer(q); return
 
     # выберем нужные поля состояния
     if which == "wl":
@@ -6396,6 +6680,7 @@ async def on_list_nav(q: CallbackQuery, bot: Bot):
     elif action == "last": page_idx = 10**9
     elif action == "close":
         # удаляем сообщение списка
+        await _safe_cb_answer(q)
         try:
             if which == "wl" and st.wl_view_msg_id:
                 await bot.delete_message(q.message.chat.id, st.wl_view_msg_id)
@@ -6422,10 +6707,10 @@ async def on_list_nav(q: CallbackQuery, bot: Bot):
             st.bl_cmd_msg_id = None
             st.bl_pages_count = 1
             st.bl_page_idx = 0
-        await q.answer()
+
         return
     else:
-        await q.answer(); return
+        await _safe_cb_answer(q); return
 
     title = "👀 Watchlist" if which == "wl" else "⛔ Blacklist"
     txt, total = _format_ticker_list_grouped(title, ticks, page_idx, 23)
@@ -6439,6 +6724,7 @@ async def on_list_nav(q: CallbackQuery, bot: Bot):
         st.bl_page_idx = min(page_idx, total - 1)
         msg_id = st.bl_view_msg_id or msg_id
 
+    await _safe_cb_answer(q)
     try:
         await bot.edit_message_text(
             chat_id=q.message.chat.id,
@@ -6453,8 +6739,6 @@ async def on_list_nav(q: CallbackQuery, bot: Bot):
         if which == "wl": st.wl_view_msg_id = msg.message_id
         else:             st.bl_view_msg_id = msg.message_id
 
-    await q.answer()
-
 # --- навигация ---
 @dp.callback_query(F.data.startswith("nav:"))
 async def on_nav(q: CallbackQuery):
@@ -6462,13 +6746,13 @@ async def on_nav(q: CallbackQuery):
     cmd = q.data.split(":",1)[1]
     _ = render_page(st, snapshot_data())  # пересчёт страниц
     if cmd == "noop":
-        await q.answer(); return
+        await _safe_cb_answer(q); return
     if cmd == "first": st.page_idx = 0
     elif cmd == "prev": st.page_idx = max(0, st.page_idx - 1)
     elif cmd == "next": st.page_idx = min(max(0, st.pages_count - 1), st.page_idx + 1)
     elif cmd == "last": st.page_idx = max(0, st.pages_count - 1)
+    await _safe_cb_answer(q)
     await rerender_one(q.from_user.id)
-    await q.answer()
 
 # --- сортировка (категории) ---
 @dp.callback_query(F.data.startswith("sortcat:"))
@@ -6481,8 +6765,8 @@ async def on_sortcat(q: CallbackQuery):
         "dpp": "sort_dpp",
         "dta": "sort_dta",              # ← добавлено
     }.get(cat, "sort")
+    await _safe_cb_answer(q)
     await rerender_one(q.from_user.id)
-    await q.answer()
 
 @dp.callback_query(F.data.startswith("sort:set:"))
 async def on_sort_set(q: CallbackQuery):
@@ -6515,8 +6799,8 @@ async def on_sort_set(q: CallbackQuery):
     st.page_idx = 0
     st.ui_mode = "main"
     _cancel_idle_timer(st)
+    await _safe_cb_answer(q, "Сортировка применена")
     await rerender_one(q.from_user.id)
-    await q.answer("Сортировка применена")
 
 # --- группировка ---
 @dp.callback_query(F.data.startswith("group:"))
@@ -6527,8 +6811,8 @@ async def on_group(q: CallbackQuery):
     st.page_idx = 0
     st.ui_mode = "main"
     _cancel_idle_timer(st)
+    await _safe_cb_answer(q, "Группировка применена")
     await rerender_one(q.from_user.id)
-    await q.answer("Группировка применена")
 
 # --- фильтры: категории ---
 @dp.callback_query(F.data.startswith("filtercat:"))
@@ -6541,14 +6825,14 @@ async def on_filtercat(q: CallbackQuery):
         "dpp": "filter_dpp",
         "dta": "filter_dta",        # ← добавлено
     }.get(cat, "filter")
+    await _safe_cb_answer(q)
     await rerender_one(q.from_user.id)
-    await q.answer()
 
 @dp.callback_query(F.data.startswith("preset:apply:"))
 async def on_preset_apply(q: CallbackQuery, bot: Bot):
     st = USER_STATES.get(q.from_user.id)
     if not st:
-        return await q.answer()
+        return await _safe_cb_answer(q)
     key = q.data.split("preset:apply:", 1)[1]
 
     # достаём пресет (встроенный или пользовательский)
@@ -6582,22 +6866,24 @@ async def on_preset_apply(q: CallbackQuery, bot: Bot):
     ensure_sort_field_in_display_fields(st)
     st.ui_mode = "main"
 
+    await _safe_cb_answer(q, "Preset applied")
     await rerender_one(q.from_user.id)
-    await q.answer("Preset applied")
 
 @dp.callback_query(F.data == "preset:save")
 async def on_preset_save(q: CallbackQuery):
     st = USER_STATES.get(q.from_user.id)
     if not st:
-        return await q.answer()
+        return await _safe_cb_answer(q)
     st.awaiting_input = "preset_save"
+    await _safe_cb_answer(q, "Waiting for name…")
+
     prompt = await q.message.answer(
         "Введите <b>название</b> пресета.\n\n"
         "Будут сохранены <i>текущие</i>: поля, сортировка (вкл. weighted/asc/desc) и группировка.",
+        reply_markup=prompt_cancel_keyboard(),
         link_preview_options=LP_DISABLED
     )
-    st.prompt_msg_id = prompt.message_id
-    await q.answer("Waiting for name…")
+    _bind_screener_input(st, q.message, prompt.message_id)
 
 @dp.message(F.text, ~F.text.startswith("/"), _awaiting_preset_save)
 async def on_preset_save_input(m: Message, bot: Bot):
@@ -6638,6 +6924,13 @@ async def on_preset_save_input(m: Message, bot: Bot):
             raise
 
 # --- фильтры: диапазоны (персонализированные приглашения, всё экранируем) ---
+def prompt_cancel_keyboard() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="❌ Cancel", callback_data="input:cancel")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
 def pretty_key_and_unit(key: str) -> Tuple[str, str]:
     m = {
         "ytw": ("YTW", ""), "ytm": ("YTM", ""), "ytc": ("YTC", ""),
@@ -6678,6 +6971,8 @@ def pretty_key_and_unit(key: str) -> Tuple[str, str]:
 @dp.callback_query(F.data.startswith("filter:range:"))
 async def on_filter_range(q: CallbackQuery):
     st = USER_STATES.setdefault(q.from_user.id, ScreenerState())
+    if q.message:
+        _bind_screener_message(st, q.message)
     key = q.data.split(":",2)[2]
     st.awaiting_input = f"range:{key}"
     title, unit = pretty_key_and_unit(key)
@@ -6690,23 +6985,41 @@ async def on_filter_range(q: CallbackQuery):
     text = (
         f"Enter the range for <b>{html.escape(title)}</b>\n"
         f"Format: <code>min-max</code>, <code>&gt;=x</code>, <code>&lt;=y</code>, <code>&gt;x</code>, <code>&lt;y</code>\n"
-        f"Examples: <code>{examples}</code>, <code>{ge}</code>, <code>{le}</code>\n"
-        f"Cancel: /cancel"
+        f"Examples: <code>{examples}</code>, <code>{ge}</code>, <code>{le}</code>"
     )
-    msg = await q.message.answer(text, link_preview_options=LP_DISABLED)
-    st.prompt_msg_id = msg.message_id
-    await q.answer()
+    await _safe_cb_answer(q)
+    msg = await q.message.answer(text, reply_markup=prompt_cancel_keyboard(), link_preview_options=LP_DISABLED)
+    _bind_screener_input(st, q.message, msg.message_id)
+
+@dp.callback_query(F.data == "input:cancel")
+async def on_input_cancel(q: CallbackQuery):
+    st = USER_STATES.setdefault(q.from_user.id, ScreenerState())
+    if not st.prompt_msg_id or not _message_matches_binding(q.message, q.message.chat.id if q.message else None, st.prompt_msg_id):
+        try:
+            await _safe_cb_answer(q, "Используйте кнопку в актуальном сообщении.", show_alert=False)
+        except Exception:
+            pass
+        return
+    await _safe_cb_answer(q, "Отменено")
+    try:
+        await q.message.delete()
+    except Exception:
+        pass
+    _clear_screener_input(st)
+    await rerender_one(q.from_user.id)
 
 @dp.message(F.text.regexp(r'^/cancel$'))
 async def on_cancel(m: Message):
     st = USER_STATES.setdefault(m.from_user.id, ScreenerState())
+    if st.awaiting_input and not _screener_input_matches(st, m):
+        return
     try:
-        if st.prompt_msg_id: await bot.delete_message(m.chat.id, st.prompt_msg_id)
+        if st.prompt_msg_id:
+            await bot.delete_message(m.chat.id, st.prompt_msg_id)
         await bot.delete_message(m.chat.id, m.message_id)
     except Exception:
         pass
-    st.awaiting_input = None
-    st.prompt_msg_id = None
+    _clear_screener_input(st)
     await rerender_one(m.from_user.id)
 
 def _assign_range(st: ScreenerState, key: str, rng: Optional[Range]):
@@ -6777,6 +7090,8 @@ async def on_text(m: Message):
     if await _alerts_try_consume_text(m):
         return
     st = USER_STATES.setdefault(m.from_user.id, ScreenerState())
+    if st.awaiting_input and not _screener_input_matches(st, m):
+        return
     if st.awaiting_input and st.awaiting_input.startswith("range:"):
         key = st.awaiting_input.split(":",1)[1]
         rng = parse_range(m.text)
@@ -6791,28 +7106,28 @@ async def on_text(m: Message):
             except Exception:
                 pass
             return
-        _assign_range(st, key, rng); st.awaiting_input = None
+        _assign_range(st, key, rng)
         st.page_idx = 0
         try:
             if st.prompt_msg_id: await bot.delete_message(m.chat.id, st.prompt_msg_id)
             await bot.delete_message(m.chat.id, m.message_id)
         except Exception:
             pass
-        st.prompt_msg_id = None
+        _clear_screener_input(st)
         await rerender_one(m.from_user.id)
         return
     elif st.awaiting_input == "pagesize":
         try:
             n = int(m.text.strip())
             if n < 1: raise ValueError()
-            st.page_size = n; st.awaiting_input = None
+            st.page_size = n
             st.page_idx = 0
             try:
                 if st.prompt_msg_id: await bot.delete_message(m.chat.id, st.prompt_msg_id)
                 await bot.delete_message(m.chat.id, m.message_id)
             except Exception:
                 pass
-            st.prompt_msg_id = None
+            _clear_screener_input(st)
             await rerender_one(m.from_user.id)
         except:
             reply = await m.reply("Введите целое >= 1.", link_preview_options=LP_DISABLED)
@@ -6824,14 +7139,14 @@ async def on_text(m: Message):
         return
     elif st.awaiting_input == "blacklist":
         tickers = [t.strip().upper() for t in re.split(r'[,\s]+', m.text.strip()) if t.strip()]
-        st.blacklist.update(tickers); st.awaiting_input = None
+        st.blacklist.update(tickers)
         st.page_idx = 0
         try:
             if st.prompt_msg_id: await bot.delete_message(m.chat.id, st.prompt_msg_id)
             await bot.delete_message(m.chat.id, m.message_id)
         except Exception:
             pass
-        st.prompt_msg_id = None
+        _clear_screener_input(st)
         await rerender_one(m.from_user.id)
         # Если сейчас открыто сообщение с blacklist — обновим его тоже
         if getattr(st, "list_view_msg_id", None) and getattr(st, "list_view_kind", None) == "bl":
@@ -6853,8 +7168,8 @@ async def on_ratings(q: CallbackQuery):
     if st.filters.ratings is None:
         st.filters.ratings = set()
     st.ui_mode = "filter_ratings"
+    await _safe_cb_answer(q)
     await rerender_one(q.from_user.id)
-    await q.answer()
 
 @dp.callback_query(F.data.startswith("filter:rating_toggle:"))
 async def on_rating_toggle(q: CallbackQuery):
@@ -6865,8 +7180,8 @@ async def on_rating_toggle(q: CallbackQuery):
     else: st.filters.ratings.add(r)
     st.ui_mode = "filter_ratings"
     st.page_idx = 0
+    await _safe_cb_answer(q)
     await rerender_one(q.from_user.id)
-    await q.answer()
 
 @dp.callback_query(F.data == "filter:sectors")
 async def on_sectors(q: CallbackQuery):
@@ -6875,8 +7190,8 @@ async def on_sectors(q: CallbackQuery):
         st.filters.sectors = set()
     st.ui_mode = "filter_sectors"
     st.page_idx = 0
+    await _safe_cb_answer(q)
     await rerender_one(q.from_user.id)
-    await q.answer()
 
 @dp.callback_query(F.data.startswith("filter:sector_toggle:"))
 async def on_sector_toggle(q: CallbackQuery):
@@ -6887,8 +7202,8 @@ async def on_sector_toggle(q: CallbackQuery):
     else: st.filters.sectors.add(val)
     st.ui_mode = "filter_sectors"
     st.page_idx = 0
+    await _safe_cb_answer(q)
     await rerender_one(q.from_user.id)
-    await q.answer()
 
 @dp.callback_query(F.data == "filter:countries")
 async def on_countries(q: CallbackQuery):
@@ -6897,8 +7212,8 @@ async def on_countries(q: CallbackQuery):
         st.filters.countries = set()
     st.ui_mode = "filter_countries"
     st.page_idx = 0
+    await _safe_cb_answer(q)
     await rerender_one(q.from_user.id)
-    await q.answer()
 
 @dp.callback_query(F.data.startswith("filter:country_toggle"))
 async def on_country_toggle(q: CallbackQuery):
@@ -6914,10 +7229,10 @@ async def on_country_toggle(q: CallbackQuery):
         try:
             idx = int(q.data.split(":", 2)[2])
         except Exception:
-            await q.answer(); return
+            await _safe_cb_answer(q); return
         opts = collect_all_countries(snapshot_data())
         if idx < 0 or idx >= len(opts):
-            await q.answer(); return
+            await _safe_cb_answer(q); return
         val = opts[idx] if (opts[idx] is not None and opts[idx] != "") else "Unknown"
     else:
         # бэкап: старый формат с URL-кодированием
@@ -6930,8 +7245,8 @@ async def on_country_toggle(q: CallbackQuery):
 
     st.ui_mode = "filter_countries"
     st.page_idx = 0
+    await _safe_cb_answer(q)
     await rerender_one(q.from_user.id)
-    await q.answer()
 
 @dp.callback_query(F.data == "filter:coupons")
 async def on_coupons(q: CallbackQuery):
@@ -6940,8 +7255,8 @@ async def on_coupons(q: CallbackQuery):
         st.filters.coupons_per_year = set()
     st.ui_mode = "filter_coupons"
     st.page_idx = 0
+    await _safe_cb_answer(q)
     await rerender_one(q.from_user.id)
-    await q.answer()
 
 @dp.callback_query(F.data.startswith("filter:coupon_toggle:"))
 async def on_coupon_toggle(q: CallbackQuery):
@@ -6950,14 +7265,14 @@ async def on_coupon_toggle(q: CallbackQuery):
     try:
         n = int(val)
     except:
-        await q.answer(); return
+        await _safe_cb_answer(q); return
     st.filters.coupons_per_year = st.filters.coupons_per_year or set()
     if n in st.filters.coupons_per_year: st.filters.coupons_per_year.remove(n)
     else: st.filters.coupons_per_year.add(n)
     st.ui_mode = "filter_coupons"
     st.page_idx = 0
+    await _safe_cb_answer(q)
     await rerender_one(q.from_user.id)
-    await q.answer()
 
 @dp.callback_query(F.data == "filter:has_offer_cycle")
 async def on_has_offer_cycle(q: CallbackQuery):
@@ -6968,8 +7283,8 @@ async def on_has_offer_cycle(q: CallbackQuery):
     st.ui_mode = "filter"
     st.page_idx = 0
     label = {None: "including", False: "excluding", True: "only"}[nxt]
+    await _safe_cb_answer(q, f"Put/Call: {label}")
     await rerender_one(q.from_user.id)
-    await q.answer(f"Put/Call: {label}")
 
 @dp.callback_query(F.data == "filter:clear")
 async def on_filter_clear(q: CallbackQuery):
@@ -6977,8 +7292,8 @@ async def on_filter_clear(q: CallbackQuery):
     st.filters = FilterState()
     st.ui_mode = "filter"
     st.page_idx = 0
+    await _safe_cb_answer(q, "Фильтры сброшены")
     await rerender_one(q.from_user.id)
-    await q.answer("Фильтры сброшены к дефолтным")
 
 # --- settings / fields ---
 @dp.callback_query(F.data.startswith("settings:"))
@@ -6986,14 +7301,15 @@ async def on_settings(q: CallbackQuery):
     st = USER_STATES.setdefault(q.from_user.id, ScreenerState())
     cmd = q.data.split(":",1)[1]
     st.ui_mode = "settings"
+    await _safe_cb_answer(q)
     if cmd == "toggle_order":
         st.sort_desc = not st.sort_desc
         st.page_idx = 0
         await rerender_one(q.from_user.id)
     elif cmd == "pagesize":
         st.awaiting_input = "pagesize"
-        msg = await q.message.answer("Введите новое значение Group size (>=1):", link_preview_options=LP_DISABLED)
-        st.prompt_msg_id = msg.message_id
+        msg = await q.message.answer("Введите новое значение Group size (>=1):", reply_markup=prompt_cancel_keyboard(), link_preview_options=LP_DISABLED)
+        _bind_screener_input(st, q.message, msg.message_id)
     elif cmd == "fields":
         st.ui_mode = "settings_fields_root"   # ← БЫЛО "settings_fields"
         st.page_idx = 0
@@ -7004,9 +7320,8 @@ async def on_settings(q: CallbackQuery):
         await rerender_one(q.from_user.id)
     elif cmd == "blacklist":
         st.awaiting_input = "blacklist"
-        msg = await q.message.answer("Введите тикеры для чёрного списка через пробел/запятую.", link_preview_options=LP_DISABLED)
-        st.prompt_msg_id = msg.message_id
-    await q.answer()
+        msg = await q.message.answer("Введите тикеры для чёрного списка через пробел/запятую.", reply_markup=prompt_cancel_keyboard(), link_preview_options=LP_DISABLED)
+        _bind_screener_input(st, q.message, msg.message_id)
 
 @dp.callback_query(F.data.startswith("fields_cat:"))
 async def on_fields_cat(q: CallbackQuery):
@@ -7014,8 +7329,8 @@ async def on_fields_cat(q: CallbackQuery):
     cat = q.data.split(":",1)[1]
     st.ui_mode = f"settings_fields_cat:{cat}"
     st.page_idx = 0
+    await _safe_cb_answer(q)
     await rerender_one(q.from_user.id)
-    await q.answer()
 
 @dp.callback_query(F.data.startswith("fields:toggle:"))
 async def on_fields_toggle(q: CallbackQuery):
@@ -7034,8 +7349,8 @@ async def on_fields_toggle(q: CallbackQuery):
     else:
         st.ui_mode = "settings_fields"
     st.page_idx = 0
+    await _safe_cb_answer(q)
     await rerender_one(q.from_user.id)
-    await q.answer()
 
 @dp.callback_query(F.data == "fields:done")
 async def on_fields_done(q: CallbackQuery):
@@ -7045,8 +7360,8 @@ async def on_fields_done(q: CallbackQuery):
     ensure_sort_field_in_display_fields(st)
     st.ui_mode = "settings"
     st.page_idx = 0
+    await _safe_cb_answer(q, "Поля сохранены")
     await rerender_one(q.from_user.id)
-    await q.answer("Поля сохранены")
 
 async def change_watcher_loop():
     from time import monotonic
@@ -7085,9 +7400,24 @@ async def change_watcher_loop():
             await asyncio.sleep(0.5)
 
 async def bot_main():
+    # фоновые задачи создаём один раз
     asyncio.create_task(change_watcher_loop())
-    asyncio.create_task(alerts_engine_loop())   # <-- ДОБАВИТЬ
-    await dp.start_polling(bot, handle_signals=False)
+    asyncio.create_task(alerts_engine_loop())
+
+    backoff = 3.0
+
+    while True:
+        try:
+            print(f"[{_ts()}] 🤖 TG polling started")
+            await dp.start_polling(bot, handle_signals=False)
+
+            # если polling завершился без исключения — тоже поднимаем заново
+            print(f"[{_ts()}] ⚠️ TG polling stopped, restarting...")
+        except Exception as e:
+            print(f"[{_ts()}] ⚠️ TG polling crashed: {type(e).__name__}: {e}")
+
+        await asyncio.sleep(backoff)
+        backoff = min(backoff * 2, 30.0)
 
 def start_bot_thread():
     loop = asyncio.new_event_loop()
@@ -7109,7 +7439,7 @@ else:
 
 
 def initial_list():
-    with Client(token) as client:
+    with Client(token, target=TBANK_GRPC_TARGET) as client:
         r = client.instruments.bonds(
             instrument_status=1
         )
@@ -7337,9 +7667,10 @@ def confirming_list_for_analysis():
 # fix_date по купонам: instrument_id -> {coupon_date: fix_date}
 coupon_fix_dates_bonds = {}
 
-# кеш "расчётного дня" (T+1 по торговому календарю)
+# кеш ближайшего реального дня покупки и расчётного дня этой покупки
+_PURCHASE_DAY_CACHE = None
 _SETTLEMENT_DAY_CACHE = None
-_SETTLEMENT_DAY_CACHE_FOR = None
+_TRADING_DAYS_CACHE_FOR = None
 
 def _pb_to_date(x):
     """Приводит protobuf Timestamp/Datetime к date."""
@@ -7382,19 +7713,22 @@ def _call_trading_schedules(client, exchange: str, from_dt: datetime, to_dt: dat
 
     raise AttributeError("TradingSchedules method not found in tinkoff SDK")
 
-def _next_trading_day_tinkoff(exchange: str = "MOEX", max_ahead_days: int = 90) -> datetime:
-    """Возвращает ближайший следующий торговый день (>= завтра) по TradingSchedules."""
-    today = date.today()
-    start_from = today + timedelta(days=1)
-
+def _first_trading_day_on_or_after_tinkoff(start_from: date, exchange: str = "MOEX", max_ahead_days: int = 90) -> datetime:
+    """Возвращает ближайший торговый день >= start_from по TradingSchedules."""
     best = None
-    step = 7  # на случай ограничений по диапазону — ходим окнами
+    step = 7  # ходим окнами на случай ограничений по диапазону
 
-    with Client(token) as client:
+    with Client(token, target=TBANK_GRPC_TARGET) as client:
         for offset in range(0, max_ahead_days, step):
-            # ВАЖНО: TradingSchedules ругается, если from_dt "в прошлом" относительно момента запроса.
-            # Поэтому начинаем окна строго с "завтра", а не с "сегодня 00:00".
-            from_dt = datetime.combine(start_from + timedelta(days=offset), datetime.min.time())
+            window_start = start_from + timedelta(days=offset)
+
+            # TradingSchedules не любит from_dt "в прошлом".
+            # Если старт окна сегодня или раньше — начинаем от текущего момента.
+            if window_start <= date.today():
+                from_dt = datetime.now()
+            else:
+                from_dt = datetime.combine(window_start, datetime.min.time())
+
             to_dt = from_dt + timedelta(days=step + 1)
 
             resp = _call_trading_schedules(client, exchange, from_dt, to_dt)
@@ -7412,56 +7746,92 @@ def _next_trading_day_tinkoff(exchange: str = "MOEX", max_ahead_days: int = 90) 
             if best is not None:
                 return datetime.combine(best, datetime.min.time())
 
-    raise RuntimeError("Не найден следующий торговый день через TradingSchedules")
+    raise RuntimeError("Не найден торговый день через TradingSchedules")
+
+
+def _ensure_purchase_and_settlement_days(force: bool = False):
+    """
+    Считает:
+    - ближайший реальный день, когда бумагу можно купить сейчас;
+    - расчётный день этой покупки (T+1 по торговым дням).
+    Кешируем на сутки.
+    """
+    global _PURCHASE_DAY_CACHE, _SETTLEMENT_DAY_CACHE, _TRADING_DAYS_CACHE_FOR
+    today = date.today()
+
+    if force or _PURCHASE_DAY_CACHE is None or _SETTLEMENT_DAY_CACHE is None or _TRADING_DAYS_CACHE_FOR != today:
+        try:
+            purchase_dt = _first_trading_day_on_or_after_tinkoff(today, exchange="MOEX", max_ahead_days=90)
+            settlement_dt = _first_trading_day_on_or_after_tinkoff(
+                purchase_dt.date() + timedelta(days=1),
+                exchange="MOEX",
+                max_ahead_days=90
+            )
+
+            _PURCHASE_DAY_CACHE = purchase_dt
+            _SETTLEMENT_DAY_CACHE = settlement_dt
+            _TRADING_DAYS_CACHE_FOR = today
+            return
+
+        except Exception as e:
+            if force:
+                raise
+
+            print(f"[{_ts()}] ⚠️ Не удалось получить TradingSchedules ({e}). Фолбэк: пропускаю только выходные.")
+
+            purchase_d = today
+            while purchase_d.weekday() >= 5:
+                purchase_d += timedelta(days=1)
+
+            settlement_d = purchase_d + timedelta(days=1)
+            while settlement_d.weekday() >= 5:
+                settlement_d += timedelta(days=1)
+
+            _PURCHASE_DAY_CACHE = datetime.combine(purchase_d, datetime.min.time())
+            _SETTLEMENT_DAY_CACHE = datetime.combine(settlement_d, datetime.min.time())
+            _TRADING_DAYS_CACHE_FOR = today
+
+
+def get_purchase_day(force: bool = False) -> datetime:
+    _ensure_purchase_and_settlement_days(force=force)
+    return _PURCHASE_DAY_CACHE
 
 
 def get_settlement_day(force: bool = False) -> datetime:
     """
-    'Расчётный день покупки сегодня' (T+1, но с учётом неторговых дней).
-    Кешируем на сутки.
+    Реальный расчётный день покупки, которую можно совершить сейчас.
+    На выходных/праздниках это уже не "следующий торговый день",
+    а T+1 от первого доступного дня покупки.
     """
-    global _SETTLEMENT_DAY_CACHE, _SETTLEMENT_DAY_CACHE_FOR
-    today = date.today()
-
-    if force or _SETTLEMENT_DAY_CACHE is None or _SETTLEMENT_DAY_CACHE_FOR != today:
-        try:
-            _SETTLEMENT_DAY_CACHE = _next_trading_day_tinkoff(exchange="MOEX", max_ahead_days=90)
-            _SETTLEMENT_DAY_CACHE_FOR = today
-        except Exception as e:
-            # Если force=True — пусть пробросится (setting_timeframes поймает и красиво залогирует).
-            if force:
-                raise
-
-            # Иначе (когда нас вызывают глубоко в расчётах) — НЕ падаем, а используем фолбэк.
-            print(f"[{_ts()}] ⚠️ Не удалось получить TradingSchedules ({e}). Фолбэк: пропускаю только выходные.")
-            d = datetime.today() + timedelta(days=1)
-            while d.weekday() >= 5:
-                d += timedelta(days=1)
-            _SETTLEMENT_DAY_CACHE = d
-            _SETTLEMENT_DAY_CACHE_FOR = today
-
+    _ensure_purchase_and_settlement_days(force=force)
     return _SETTLEMENT_DAY_CACHE
 
 
 def setting_timeframes():
     print('Установка временных интервалов…')
     try:
-        d = get_settlement_day(force=True)
-        print(f"[{_ts()}] ✅ Расчётный день T+1 (TradingSchedules): {d.date()}")
-        return d
+        _ensure_purchase_and_settlement_days(force=True)
+        buy_d = get_purchase_day().date()
+        settle_d = get_settlement_day().date()
+        print(f"[{_ts()}] ✅ Ближайший день покупки: {buy_d}; расчётный день T+1: {settle_d}")
+        return get_settlement_day()
     except Exception as e:
-        # ВАЖНО: сохраняем фолбэк в кеш, чтобы дальше (в расчётах доходности/цен)
-        # get_settlement_day() не пытался снова дергать TradingSchedules и не падал.
-        global _SETTLEMENT_DAY_CACHE, _SETTLEMENT_DAY_CACHE_FOR
+        global _PURCHASE_DAY_CACHE, _SETTLEMENT_DAY_CACHE, _TRADING_DAYS_CACHE_FOR
 
         print(f"[{_ts()}] ⚠️ Не удалось получить TradingSchedules ({e}). Фолбэк: пропускаю только выходные.")
-        d = datetime.today() + timedelta(days=1)
-        while d.weekday() >= 5:
-            d += timedelta(days=1)
 
-        _SETTLEMENT_DAY_CACHE = d
-        _SETTLEMENT_DAY_CACHE_FOR = date.today()
-        return d
+        purchase_d = date.today()
+        while purchase_d.weekday() >= 5:
+            purchase_d += timedelta(days=1)
+
+        settlement_d = purchase_d + timedelta(days=1)
+        while settlement_d.weekday() >= 5:
+            settlement_d += timedelta(days=1)
+
+        _PURCHASE_DAY_CACHE = datetime.combine(purchase_d, datetime.min.time())
+        _SETTLEMENT_DAY_CACHE = datetime.combine(settlement_d, datetime.min.time())
+        _TRADING_DAYS_CACHE_FOR = date.today()
+        return _SETTLEMENT_DAY_CACHE
 
 def building_lambdas():
     pd_table = {'AAA+': (0.00143, 0.00562, 0.00989), 'AAA': (0.00143, 0.00562, 0.00989), 'AAA-': (0.00143, 0.00562, 0.00989),
@@ -7508,7 +7878,7 @@ def coupon_cashflows():
 
         for attempt in range(max_retries + 1):
             try:
-                with Client(token) as client:
+                with Client(token, target=TBANK_GRPC_TARGET) as client:
                     r = client.instruments.get_bond_coupons(
                         instrument_id=instrument_id,
                         from_=day,
@@ -7579,7 +7949,7 @@ def historic_volume_request(max_retries: int = 3):
     print('Запрос исторических данных по объёмам за сегодня…')
 
     # ВАЖНО: клиент создаём один раз, а не на каждую бумагу
-    with Client(token) as client:
+    with Client(token, target=TBANK_GRPC_TARGET) as client:
         for uid in tqdm(uid_bonds):
             ok = False
             last_err = None
@@ -7617,7 +7987,7 @@ def historic_prices_request():
     print('Запрос исторических последних цен…')
     last_price_bonds = {}
     count = 0
-    with Client(token) as client:
+    with Client(token, target=TBANK_GRPC_TARGET) as client:
         r = client.market_data.get_last_prices(
             instrument_id=uid_bonds
         )
@@ -7645,8 +8015,7 @@ def historic_prices_request():
     return last_price_bonds
 
 # --- Health-check подписок ---
-_SUBS_BY_QID: dict[int, set[str]] = {}  # по id(queue) -> множество instrument_uid
-
+_SUBS_BY_QID: dict[int, Optional[set[str]]] = {}  # None = ещё нет ответа на get_my_subscriptions
 def _make_candles_subscribe_request(uids: list[str]) -> MarketDataRequest:
     """Единообразно строим запрос на подписку дневных свечей по списку UID."""
     return MarketDataRequest(
@@ -7671,7 +8040,7 @@ async def volumes_and_last_prices_stream(uids_chunk: list[str], q: asyncio.Queue
     backoff = 1.0
     while True:
         last_seen = time.monotonic()
-        _SUBS_BY_QID[id(q)] = set()
+        _SUBS_BY_QID[id(q)] = None
 
         async def request_iterator():
             # первичная подписка на весь батч
@@ -7687,7 +8056,7 @@ async def volumes_and_last_prices_stream(uids_chunk: list[str], q: asyncio.Queue
                     pass
 
         try:
-            async with AsyncClient(token) as client:
+            async with AsyncClient(token, target=TBANK_GRPC_TARGET) as client:
                 stream = client.market_data_stream.market_data_stream(request_iterator())
                 async for r in stream:
                     # --- HEARTBEAT / Ping ---
@@ -7775,7 +8144,7 @@ async def subscriptions_guard(workers: list[dict], period_sec: int = 300):
         # запросим состав подписок
         for w in workers:
             q = w["q"]
-            _SUBS_BY_QID[id(q)] = set()
+            _SUBS_BY_QID[id(q)] = None
             # если у воркера нет очереди (стрим в реконнекте) — пропускаем
             if q is not None:
                 await q.put(MarketDataRequest(get_my_subscriptions=GetMySubscriptions()))
@@ -7788,7 +8157,10 @@ async def subscriptions_guard(workers: list[dict], period_sec: int = 300):
                 print(f"[{_ts()}] [WAIT] {w['name']}: стрим перезапускается — проверку подписок пропустил")
                 continue
             expected = set(w["uids"])
-            actual = _SUBS_BY_QID.get(id(q), set())
+            actual = _SUBS_BY_QID.get(id(q), None)
+            if actual is None:
+                print(f"[{_ts()}] [WAIT] {w['name']}: нет ответа на get_my_subscriptions — HEAL пропущен")
+                continue
             missing = expected - actual
             if missing:
                 print(f"[{_ts()}] [HEAL] {w['name']}: не хватает {len(missing)} — повторная подписка на батч")
@@ -7826,8 +8198,9 @@ def profitability_and_duration_calculation(price, instrument_id):
             return None
 
         try:
-            y = px.xirr(dates, cfs)
-        except Exception:
+            y = pxa.xirr(dates, cfs)
+        except Exception as e:
+            print(f"[{_ts()}] ⚠️ XIRR failed for {instrument_id}: {type(e).__name__}: {e}")
             return None
 
         if y is None:
@@ -7881,22 +8254,28 @@ def profitability_and_duration_calculation(price, instrument_id):
         return (-dmod * dy1 + 0.5 * cmod * dy1 * dy1,
                 dmod * dy1 + 0.5 * cmod * dy1 * dy1)
 
+    def _filter_unreachable_coupons(dates, cfs, fd_map_, settlement_date_):
+        out_dates, out_cfs = [], []
+        for d, cf in zip(dates, cfs):
+            fd = fd_map_.get(d)
+            # Если fix_date раньше расчётного дня — этот купон уже недостижим
+            if fd is not None and fd < settlement_date_:
+                continue
+            out_dates.append(d)
+            out_cfs.append(cf)
+        return out_dates, out_cfs
+
     # --- CF до погашения ---
-    cm_dates = sorted(coupons_to_maturity_bonds[instrument_id].keys())
-    cm_cfs = [coupons_to_maturity_bonds[instrument_id][d] for d in cm_dates]
+    cm_dates_src = sorted(coupons_to_maturity_bonds[instrument_id].keys())
+    cm_cfs_src = [coupons_to_maturity_bonds[instrument_id][d] for d in cm_dates_src]
 
     # гарантируем одинаковый порядок по тем же датам
-    w_cm_dates = cm_dates
-    w_cm_cfs = [weighted_coupons_to_maturity_bonds[instrument_id][d] for d in cm_dates]
+    w_cm_dates_src = cm_dates_src[:]
+    w_cm_cfs_src = [weighted_coupons_to_maturity_bonds[instrument_id][d] for d in cm_dates_src]
 
     fd_map = coupon_fix_dates_bonds.get(instrument_id) or {}
-    if cm_dates:
-        fd0 = fd_map.get(cm_dates[0])
-        if fd0 and fd0 < settlement_date:
-            cm_dates = cm_dates[1:]
-            cm_cfs = cm_cfs[1:]
-            w_cm_dates = w_cm_dates[1:]
-            w_cm_cfs = w_cm_cfs[1:]
+    cm_dates, cm_cfs = _filter_unreachable_coupons(cm_dates_src, cm_cfs_src, fd_map, settlement_date)
+    w_cm_dates, w_cm_cfs = _filter_unreachable_coupons(w_cm_dates_src, w_cm_cfs_src, fd_map, settlement_date)
 
     # --- YTM (обычный) ---
     YTM_xirr = _safe_xirr(
@@ -7930,20 +8309,15 @@ def profitability_and_duration_calculation(price, instrument_id):
     # --- YTC ---
     if instrument_id in offer_or_call_option_date_bonds.keys():
 
-        co_dates = sorted(coupons_to_offer_bonds[instrument_id].keys())
-        co_cfs = [coupons_to_offer_bonds[instrument_id][d] for d in co_dates]
+        co_dates_src = sorted(coupons_to_offer_bonds[instrument_id].keys())
+        co_cfs_src = [coupons_to_offer_bonds[instrument_id][d] for d in co_dates_src]
 
-        w_co_dates = co_dates
-        w_co_cfs = [weighted_coupons_to_offer_bonds[instrument_id][d] for d in co_dates]
+        w_co_dates_src = co_dates_src[:]
+        w_co_cfs_src = [weighted_coupons_to_offer_bonds[instrument_id][d] for d in co_dates_src]
 
         fd_map = coupon_fix_dates_bonds.get(instrument_id) or {}
-        if co_dates:
-            fd0 = fd_map.get(co_dates[0])
-            if fd0 and fd0 < settlement_date:
-                co_dates = co_dates[1:]
-                co_cfs = co_cfs[1:]
-                w_co_dates = w_co_dates[1:]
-                w_co_cfs = w_co_cfs[1:]
+        co_dates, co_cfs = _filter_unreachable_coupons(co_dates_src, co_cfs_src, fd_map, settlement_date)
+        w_co_dates, w_co_cfs = _filter_unreachable_coupons(w_co_dates_src, w_co_cfs_src, fd_map, settlement_date)
 
         YTC_xirr = _safe_xirr(
             [today_, *co_dates, offer_or_call_option_date_bonds[instrument_id]],
@@ -7962,12 +8336,13 @@ def profitability_and_duration_calculation(price, instrument_id):
             [-pv, *w_co_cfs, w_red_c]
         )
 
-        # оставляю как у тебя (keys/values) — логика не тронута
-        dates_c = [*coupons_to_offer_bonds[instrument_id].keys(), offer_or_call_option_date_bonds[instrument_id]]
-        cfs_c = [*coupons_to_offer_bonds[instrument_id].values(), nominal_bonds[instrument_id]]
+        # duration / convexity должны считаться по тем же потокам,
+        # по которым посчитан YTC_xirr, то есть уже после фильтрации по fix_date
+        dates_c = [*co_dates, offer_or_call_option_date_bonds[instrument_id]]
+        cfs_c = [*co_cfs, nominal_bonds[instrument_id]]
 
-        w_dates_c = [*weighted_coupons_to_offer_bonds[instrument_id].keys(), offer_or_call_option_date_bonds[instrument_id]]
-        w_cfs_c = [*weighted_coupons_to_offer_bonds[instrument_id].values(), w_red_c]
+        w_dates_c = [*w_co_dates, offer_or_call_option_date_bonds[instrument_id]]
+        w_cfs_c = [*w_co_cfs, w_red_c]
     else:
         YTC_xirr = YTM_xirr
         weighted_YTC_xirr = weighted_YTM_xirr
@@ -8130,10 +8505,12 @@ except ZoneInfoNotFoundError:
 
 ENGINE_STOP_TIME = dtime(0, 6)   # 00:06 МСК
 ENGINE_START_TIME = dtime(6, 6)  # 06:06 МСК
+REFERENCE_REFRESH_INTERVAL_HOURS = 3
 
 _ENGINE_TASKS = []
 _ENGINE_RUNNING = False
 _LAST_SESSION_DATE = None  # дата «движкового дня» (стартует в 06:06)
+_LAST_REFERENCE_REFRESH_SLOT = None  # (session_date, slot_idx), где slot_idx=1 -> 09:06, 2 -> 12:06, ...
 
 def _msk_now() -> datetime:
     return datetime.now(MSK_TZ)
@@ -8148,6 +8525,157 @@ def _seconds_until(target_t: dtime) -> float:
     if target <= now:
         target += timedelta(days=1)
     return (target - now).total_seconds()
+
+def _session_anchor_dt(session: date) -> datetime:
+    return datetime.combine(session, ENGINE_START_TIME).replace(tzinfo=MSK_TZ)
+
+def _session_stop_dt(session: date) -> datetime:
+    return datetime.combine(session + timedelta(days=1), ENGINE_STOP_TIME).replace(tzinfo=MSK_TZ)
+
+def _reference_refresh_slots(session: date) -> list[tuple[int, datetime]]:
+    anchor = _session_anchor_dt(session)
+    stop_dt = _session_stop_dt(session)
+    out = []
+    slot = 1
+    while True:
+        due = anchor + timedelta(hours=REFERENCE_REFRESH_INTERVAL_HOURS * slot)
+        if due >= stop_dt:
+            break
+        out.append((slot, due))
+        slot += 1
+    return out
+
+def _latest_reference_refresh_slot_due(now: datetime) -> tuple[date, int, datetime] | None:
+    session = _session_date(now)
+    latest = None
+
+    for slot_idx, due_dt in _reference_refresh_slots(session):
+        if due_dt <= now:
+            latest = (session, slot_idx, due_dt)
+        else:
+            break
+
+    return latest
+
+def _next_reference_refresh_due(now: datetime) -> datetime | None:
+    session = _session_date(now)
+    for _, due in _reference_refresh_slots(session):
+        if due > now:
+            return due
+    return None
+
+def _value_changed(old, new) -> bool:
+    if isinstance(old, float) and isinstance(new, float):
+        return not math.isclose(old, new, rel_tol=1e-12, abs_tol=1e-12)
+    return old != new
+
+def _fetch_reference_for_existing_uids(existing_uids: list[str]):
+    targets = set(existing_uids)
+    ticker_bonds_new, name_bonds_new = {}, {}
+    coupon_quantity_per_year_bonds_new, maturity_date_bonds_new = {}, {}
+    nominal_bonds_new, aci_bonds_new = {}, {}
+    country_of_risk_bonds_new, sector_bonds_new = {}, {}
+    issue_size_bonds_new, issue_size_money_bonds_new = {}, {}
+
+    if not targets:
+        return (
+            ticker_bonds_new, name_bonds_new, coupon_quantity_per_year_bonds_new, maturity_date_bonds_new,
+            nominal_bonds_new, aci_bonds_new, country_of_risk_bonds_new, sector_bonds_new,
+            issue_size_bonds_new, issue_size_money_bonds_new,
+        )
+
+    with Client(token, target=TBANK_GRPC_TARGET) as client:
+        r = client.instruments.bonds(instrument_status=1)
+
+    for bond in r.instruments:
+        instrument_id = bond.uid
+        if instrument_id not in targets:
+            continue
+
+        ticker_bonds_new[instrument_id] = bond.ticker
+        name_bonds_new[instrument_id] = bond.name
+        coupon_quantity_per_year_bonds_new[instrument_id] = bond.coupon_quantity_per_year
+        maturity_date_bonds_new[instrument_id] = bond.maturity_date.date()
+        nominal_bonds_new[instrument_id] = bond.nominal.units + (bond.nominal.nano * 10 ** (-9))
+        aci_bonds_new[instrument_id] = bond.aci_value.units + (bond.aci_value.nano * 10 ** (-9))
+        country_of_risk_bonds_new[instrument_id] = bond.country_of_risk_name
+        sector_bonds_new[instrument_id] = bond.sector if bond.sector != "" else "other"
+        issue_size_bonds_new[instrument_id] = bond.issue_size
+        issue_size_money_bonds_new[instrument_id] = bond.issue_size * (bond.initial_nominal.units + (bond.initial_nominal.nano * 10 ** (-9)))
+
+    return (
+        ticker_bonds_new, name_bonds_new, coupon_quantity_per_year_bonds_new, maturity_date_bonds_new,
+        nominal_bonds_new, aci_bonds_new, country_of_risk_bonds_new, sector_bonds_new,
+        issue_size_bonds_new, issue_size_money_bonds_new,
+    )
+
+def engine_refresh_reference_existing_only():
+    """
+    Обновляет только уже существующий список uid_bonds:
+    - справочник облигаций
+    - пересчитывает метрики только для реально изменившихся облигаций
+    Последние цены и дневной объём НЕ трогает.
+    """
+    existing_uids = list(uid_bonds)
+    if not existing_uids:
+        print(f"[{_ts()}] ℹ️ ENGINE: reference refresh skipped — uid_bonds пуст")
+        return []
+
+    print(f"[{_ts()}] 🔄 ENGINE: refresh reference for existing subscribed bonds…")
+
+    ref_changed = set()
+
+    (
+        new_ticker, new_name, new_cpy, new_mat, new_nom, new_aci,
+        new_country, new_sector, new_issue, new_issue_money,
+    ) = _fetch_reference_for_existing_uids(existing_uids)
+
+    ref_map = [
+        (ticker_bonds, new_ticker),
+        (name_bonds, new_name),
+        (coupon_quantity_per_year_bonds, new_cpy),
+        (maturity_date_bonds, new_mat),
+        (nominal_bonds, new_nom),
+        (aci_bonds, new_aci),
+        (country_of_risk_bonds, new_country),
+        (sector_bonds, new_sector),
+        (issue_size_bonds, new_issue),
+        (issue_size_money_bonds, new_issue_money),
+    ]
+
+    for uid in existing_uids:
+        for current_dict, fresh_dict in ref_map:
+            if uid not in fresh_dict:
+                continue
+            new_val = fresh_dict[uid]
+            old_val = current_dict.get(uid)
+            if _value_changed(old_val, new_val):
+                current_dict[uid] = new_val
+                ref_changed.add(uid)
+
+    changed_uids = sorted(ref_changed)
+
+    recalc_ok = 0
+    recalc_skip = 0
+    for uid in changed_uids:
+        px = last_price_bonds.get(uid)
+        if px in (None, 0):
+            notify_data_changed(uid)
+            recalc_skip += 1
+            continue
+        try:
+            profitability_and_duration_calculation(px, uid)
+            recalc_ok += 1
+        except Exception as e:
+            recalc_skip += 1
+            print(f"[{_ts()}] ⚠️ ENGINE: recalc skip {uid}: {type(e).__name__}: {e}")
+            notify_data_changed(uid)
+
+    print(
+        f"[{_ts()}] ✅ ENGINE: reference refresh done. "
+        f"changed={len(changed_uids)}, recalc_ok={recalc_ok}, recalc_skip={recalc_skip}"
+    )
+    return changed_uids
 
 def engine_refresh_all():
     """Утренний перезапуск движка: заново тянем данные и ОБНОВЛЯЕМ глобальные словари (in-place)."""
@@ -8275,7 +8803,7 @@ async def _engine_stop_streams():
 
 
 async def engine_supervisor():
-    global _LAST_SESSION_DATE
+    global _LAST_SESSION_DATE, _LAST_REFERENCE_REFRESH_SLOT
 
     # На старте файла данные уже инициализированы твоим текущим блоком выше
     _LAST_SESSION_DATE = _session_date(_msk_now())
@@ -8291,20 +8819,46 @@ async def engine_supervisor():
 
         # активный период (06:06..00:06 МСК)
         session = _session_date(now)
+
+        # 1) утренний полный refresh ровно на старте новой session_date
         if session != _LAST_SESSION_DATE and now.time() >= ENGINE_START_TIME:
             try:
                 await asyncio.to_thread(engine_refresh_all)
                 _LAST_SESSION_DATE = session
+                _LAST_REFERENCE_REFRESH_SLOT = (session, 0)
+                now = _msk_now()
             except Exception as e:
                 print(f"[{_ts()}] ⚠️ ENGINE supervisor: refresh failed: {type(e).__name__}: {e}")
-                # чтобы не крутиться в tight-loop и не спамить API/логи
                 await asyncio.sleep(60)
+                continue
 
         if not _ENGINE_RUNNING:
             await _engine_start_streams()
 
-        # ждём до 00:06 и гасим стримы
-        await asyncio.sleep(_seconds_until(ENGINE_STOP_TIME))
-        await _engine_stop_streams()
+        # 2) внутридневной refresh: берём только ПОСЛЕДНИЙ уже наступивший слот,
+        # а не "догоняем" старые слоты по одному каждую минуту
+        latest_due = _latest_reference_refresh_slot_due(now)
+        if latest_due is not None:
+            due_session, slot_idx, _ = latest_due
+            if _LAST_REFERENCE_REFRESH_SLOT != (due_session, slot_idx):
+                try:
+                    await asyncio.to_thread(engine_refresh_reference_existing_only)
+                    _LAST_REFERENCE_REFRESH_SLOT = (due_session, slot_idx)
+                    now = _msk_now()
+                except Exception as e:
+                    print(f"[{_ts()}] ⚠️ ENGINE supervisor: reference refresh failed: {type(e).__name__}: {e}")
+                    await asyncio.sleep(60)
+
+        # 3) спим до ближайшего реального события, а не просыпаемся каждую минуту
+        next_stop_s = _seconds_until(ENGINE_STOP_TIME)
+        next_due_dt = _next_reference_refresh_due(_msk_now())
+
+        if next_due_dt is None:
+            sleep_s = next_stop_s
+        else:
+            due_s = max(1.0, (next_due_dt - _msk_now()).total_seconds())
+            sleep_s = min(next_stop_s, due_s)
+
+        await asyncio.sleep(max(1.0, sleep_s))
 
 asyncio.run(engine_supervisor())

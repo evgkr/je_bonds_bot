@@ -1,2 +1,29 @@
-/myenv
+# Virtual environments
+.venv/
+venv/
+myenv/
+
+# Secrets
 .env
+tokenAPI
+tokenAPI.py
+*.key
+
+# Certificates / local TLS files
+*.pem
+*.cer
+*.crt
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Backups
+*.bak
+*.bak-*
+*.backup
+
+# OS / editors
+.DS_Store
+.vscode/
+.idea/
